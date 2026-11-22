@@ -1,0 +1,30 @@
+# Python & build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.python
+.pytest_cache/
+
+# Compiled C binaries
+argjacent/bin/aw
+argjacent/bin/awx
+argjacent/bin/awv
+
+# Demo, sequencing data, and run outputs
+demo_out/
+*.fq
+*.fastq
+*.fq.gz
+*.fastq.gz
+*.bam
+*.bai
+*.cram
+*.tmp/
+
+# OS & editor files
+.DS_Store
+*.swp
+*~

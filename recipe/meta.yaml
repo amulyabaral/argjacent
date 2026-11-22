@@ -1,0 +1,63 @@
+{% set name = "argjacent" %}
+{% set version = "0.5.0" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  # for a release on a channel such as bioconda, replace by the URL and sha256 of the GitHub release tarball
+  path: ..
+
+build:
+  number: 0
+  script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation -vv
+  entry_points:
+    - argjacent = argjacent.cli:main
+    - argjacent-cohort = argjacent.cohort:main
+    - argjacent-selftest = argjacent.selftest:main
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+  host:
+    - python
+    - pip
+    - setuptools >=61
+    - zlib
+  run:
+    - python
+    - numpy >=1.20
+
+test:
+  # the whole test suite runs against the built package (with the zlib of the build, not the system's:
+  # zlib 1.3.2 reports a cut-off gzip file differently from older versions, and only this run showed it)
+  source_files:
+    - tests
+  requires:
+    - pytest
+  imports:
+    - argjacent
+  commands:
+    - argjacent --version
+    - argjacent --help
+    - argjacent-cohort --version
+    - argjacent-cohort --help
+    - argjacent-selftest
+    - pytest -q -p no:cacheprovider tests
+
+about:
+  home: https://github.com/amulyabaral/argjacent
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: Certified genomic contexts of genes (e.g. antibiotic resistance genes) from paired short reads of a metagenome, without assembly
+  description: |
+    ARGjacent extends genes into their flanking DNA directly from paired short reads in two passes over the reads,
+    without whole-metagenome assembly. A gene sitting in multiple genomic contexts gets one candidate per context,
+    each annotated with how far the reads certify it ("certain"), compacted GFA v1.0 output, certified two-sided
+    pairing, and multi-sample cohort deconvolution (argjacent-cohort).
+
+extra:
+  recipe-maintainers:
+    - amulyabaral

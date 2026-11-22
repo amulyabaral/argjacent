@@ -1,0 +1,16 @@
+#!/bin/sh
+# argjacent from a source folder (after `sh install.sh`). Run ./bin/argjacent -h for options.
+# When installed with pip or conda, the `argjacent` command on PATH is used directly.
+p=$0
+while [ -h "$p" ]; do
+    d=$(cd "$(dirname "$p")" && pwd -P)
+    p=$(readlink "$p")
+    case $p in /*) ;; *) p=$d/$p ;; esac
+done
+ROOT=$(cd "$(dirname "$p")/.." && pwd -P)
+if [ ! -f "$ROOT/.python" ] || [ ! -x "$ROOT/argjacent/bin/aw" ]; then
+    echo "argjacent: not installed yet. Run:  sh $ROOT/install.sh" >&2
+    exit 1
+fi
+PY=$(cat "$ROOT/.python")
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" exec "$PY" -m argjacent "$@"

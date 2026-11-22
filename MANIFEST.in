@@ -1,0 +1,3 @@
+include src/aw.c src/awx.c src/awv.c
+include README.md CHANGELOG.md LICENSE CITATION.cff
+recursive-include tests *.py
