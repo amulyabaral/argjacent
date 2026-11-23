@@ -88,6 +88,18 @@ Also callable as `argjacent cohort ...`. For cohorts with sample-specific gene F
 - **`PREFIX.cohort_repeats.tsv`**: post-repeat exit arms resolved past $\ge 400$ bp shared repeats across $S \ge 4$ samples by regressing `gene_depth` on post-repeat `depth_bins` (runs directly on `flanks.json` with no `--keep` required, and automatically upgrades to `aw.reads.tsv` k-mer measurement if `--keep` directories exist).
 - **`PREFIX.cohort.json`** & **`--gfa-dir`**: complete JSON summary plus updated per-sample GFA v1.0 graphs containing cohort-resolved `pair` and `cohort_ext` `P` paths.
 
+### Large runs on a Slurm HPC (`hpc/`)
+
+Ready-to-run Slurm array + dependent cohort scripts live in [`hpc/`](hpc/README.md) with automatic local-scratch staging (`$SLURM_TMPDIR`), BLAS thread pinning, resume-safe `.done` markers, and merged summary/QC tables:
+
+```bash
+python3 hpc/make_samplesheet.py --fastq-dir /path/to/reads -o samples.tsv
+bash hpc/submit_pipeline.sh --samples samples.tsv --genes resfinder.fa --out results/pilot --limit 1 --dry-run
+bash hpc/submit_pipeline.sh --samples samples.tsv --genes resfinder.fa --out results/cohort --cpus 8 --mem 24G --max-concurrent 20
+```
+
+See [hpc/README.md](hpc/README.md) for the complete Slurm setup, KMA pre-screening option, resource sizing guide, and `--resubmit-missing` recovery.
+
 ---
 
 ## Output Files
@@ -128,19 +140,21 @@ Eleven Malawian children's gut metagenomes (~2×114–131 bp TELL-seq vs PacBio 
 - *(Raw mechanical check before separating two sequence-verified library artifacts: 73 / 1,498 [4.87%], consisting of 34 claims on one mislabeled BioSample `SAMN42799965` refuted by both HiFi and ONT, and 39 claims reconstructing a 4,724-bp `pMB1`/`ColE1` *bla*TEM-116 reagent expression plasmid present at 175–1,279× in 11/11 TELL-seq libraries and 0/2 NovaSeq libraries.)*
 
 ### 2. Head-to-head comparison against assembly and targeted flank tools
-Three real metagenomes with PacBio HiFi truth (`H4` unseen gut, `H1` gut, `B-A2` sludge):
+Three real metagenomes with PacBio HiFi truth (`H4` unseen infant gut, `H1` adult gut, `B-A2` pig gut):
 
 | Tool | Failed claims $\ge 1$ kb | Total wall time (3 samples) | Peak RAM |
 |---|---:|---:|---:|
 | **ARGjacent (`v0.4` / `v0.5` rules)** | **0 / 834 (0.0%)** | **9.1 min** | **1.1–3.7 GB** |
-| ARGextender | 14% | hours | high |
-| MEGAHIT (whole-metagenome assembly) | 22% | 3 h 43 min | high |
-| ARGContextProfiler / Sarand | 50–52% | — | — |
+| ARGextender | 11 / 79 (13.9%) | 18.2 min | 0.2–0.3 GB |
+| MEGAHIT (whole-metagenome assembly) | 31 / 138 (22.5%) | 3 h 43 min | 3.9–8.0 GB |
+| ARGContextProfiler / Sarand ($k=141$) | 50.5–52.0% | +8–36 min over MEGAHIT | 8.0 GB |
 
-### 3. Two-sided pairing, GFA compaction, and cohort deconvolution (`v0.5.0`)
-- **Lossless GFA v1.0 round-trip:** 19,075 / 19,075 candidate paths across 32 real metagenomes reconstructed byte-for-byte with **1.56× compaction** (120.25 → 76.93 Mbp).
-- **Real PacBio HiFi two-sided pairing (22 metagenomes: 10 dev + 12 unseen held-out):** **0 / 91 chimeras (0.00%, 95% CI 0.00–3.97%)** at ±500 bp and **0 / 58 (0.00%, 95% CI 0.00–6.16%)** at ±1,000 bp, vs ~20% for Cartesian pairing, 14–45% for Main-to-Main, and 8–10% for unguarded greedy depth matching.
-- **Controlled suites (±18% coverage waves):** 0 chimeras across `span_pair`, `snv_phase`, shared-promoter `depth_bins` post-fork pairing, 3-plasmid cohort pairing with shared arms and 45×/45× ties (100% recall vs 33% single-sample), and 900-bp `IS26` post-repeat exit deconvolution (100% certified $\ge 2.5$ kb past `IS26`, 0 false exits, and 0 claims emitted on an adversarial 1:1 collinear decoy trap).
+### 3. Expanded `v0.5.0` validation: CAMI II/III, fresh real PacBio HiFi, GFA compaction, and cohort deconvolution
+- **Combined 21 unseen real PacBio HiFi metagenomes (Block F 12 concordant native + 9 fresh real gut/mock samples):** **9 / 2,757 primary claims $\ge 1$ kb failed (0.33%, exact 95% CI 0.15–0.62%; 3 / 259 independent groups)** — with **0 / 1,388 (0.00%)** in Block F and **9 / 1,369 (0.66%)** in the 9-sample expansion (8 / 9 being single 72–80 bp tandem-repeat copy-number indels and only 1 / 1,369 a 74-bp structural overshoot).
+- **16 additional CAMI II & III benchmarks** (8 CAMI II Strain Madness clinical MDRO samples [408 strains], 4 untouched CAMI III human gut samples [`14, 16, 18, 19`], and 4 CAMI II Marine samples [908 genomes]): only **1 / 384** unexplained $\ge 1$ kb fault group (`0.26%`), **0 / 292** failures at $\ge 5$ kb on Strain Madness, and **0** faults on CAMI III and Marine.
+- **Lossless GFA v1.0 round-trip:** **29,720 / 29,720** candidate paths across **51 metagenomes** (`12,976` across 26 prior archived real metagenomes at `1.56×` + `16,744` across 25 new `v0.5.0` samples at `1.63×`) reconstructed byte-for-byte with **0 mismatches**.
+- **Real PacBio HiFi two-sided pairing (31 metagenomes: 10 dev + 21 unseen held-out):** **0 / 151 chimeras (0.00%, 95% CI 0.00–2.41%)** at ±500 bp (**0 / 71** unseen held-out) and **0 / 105 (0.00%, 95% CI 0.00–3.45%)** at ±1,000 bp (**0 / 52** unseen held-out), vs 16.5–17.8% for Cartesian and Main-to-Main pairing and 7.8–8.8% for unguarded greedy depth matching. Across all 18 multi-sample cohort samples (Strain Madness, CAMI III, infant HiFi), `argjacent-cohort` Part A added **0 / 29** chimeras at ±500 bp and **0 / 24** at ±1,000 bp while doubling multi-context recall on Strain Madness (`7.6% -> 14.1%`).
+- **Controlled suites & honest Part B scope:** Across isolated 900-bp `IS26` repeats (±18% coverage waves), `argjacent-cohort` Part B certified 100% of true exits $\ge 2.5$ kb past `IS26` with 0 false exits and abstained on a 1:1 collinear trap; on multi-strain clinical communities with chained repeats (Strain Madness), Part B showed 23.6% failures (`35 / 148`) on newly extended exits and should be treated as exploratory there (see [benchmarks/v05_validation/RESULTS.md](benchmarks/v05_validation/RESULTS.md)).
 
 ### 4. Typical runtime and memory (Apple M4, `-t 8`, gzip FASTQ)
 
@@ -160,8 +174,10 @@ Three real metagenomes with PacBio HiFi truth (`H4` unseen gut, `H1` gut, `B-A2`
 - `bin/` — Source-folder CLI wrappers (`argjacent`, `argjacent-cohort`).
 - `tests/` — 68-test automated suite (`pytest`).
 - `demo/` — Quick self-test runner (`demo/run_demo.sh`).
+- `hpc/` — Slurm array & cohort pipeline scripts (`submit_pipeline.sh`, `run_array.sbatch`, `run_cohort.sbatch`, `make_samplesheet.py`, `summarize_run.py`, `test_hpc_local.sh`).
+- `benchmarks/v05_validation/` — Frozen `v0.5.0` validation protocol, scoring scripts, and full 25-sample CAMI II/III + PacBio HiFi results (`PROTOCOL.md`, `RESULTS.md`).
 - `recipe/` — Conda recipe (`meta.yaml`, `conda_build_config.yaml`).
-- `docs/` — Validation documentation (`heldout-validation.md`).
+- `docs/` — Held-out validation report (`heldout-validation.md`).
 
 ---
 

@@ -28,3 +28,13 @@ demo_out/
 .DS_Store
 *.swp
 *~
+
+# Local-only drafts, archives, raw benchmark outputs, and internal notes
+archive/
+paper/
+benchmarks/*
+!benchmarks/v05_validation/
+benchmarks/v05_validation/results/
+benchmarks/v05_validation/__pycache__/
+docs/*
+!docs/heldout-validation.md
