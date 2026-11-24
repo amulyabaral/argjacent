@@ -1,42 +1,43 @@
 # ARGjacent
 
-**Find trustworthy DNA neighborhoods around antibiotic resistance genes (or any target genes) straight from raw short-read metagenomes, without assembling the whole sample.**
+**Certified genomic contexts of antibiotic resistance genes (or arbitrary target genes) directly from paired short-read metagenomes, without whole-metagenome assembly.**
 
-Knowing which resistance genes are in a sample is only half the story. To tell whether a gene sits on a mobile plasmid, inside a transposon, or safely on a chromosome, you need the flanking DNA on both sides of it. Full metagenome assemblers are slow, memory-heavy, and often break or stitch false chimeras whenever the same gene appears in multiple places or next to repeats.
+ARGjacent reconstructs the upstream and downstream flanking DNA (default 10 kb per side) around every copy of every target gene directly from raw paired-end short reads. When a gene occurs in multiple genomic neighborhoods within the same sample (distinct plasmids, chromosomes, strains, or mobile elements), ARGjacent separates each structural branch and certifies base by base how far the reads themselves prove that molecules carrying the gene continue along that flank (`certain_bp`), stopping cleanly before unresolvable repeats rather than stitching chimeras.
 
-ARGjacent skips whole-sample assembly. It pulls out only the reads near your target genes, reconstructs every genomic neighborhood separately, and tells you base by base how far the reads actually prove each flank (`certain_bp`). When it hits an unresolvable repeat, it stops cleanly instead of guessing.
-
-![How ARGjacent works](docs/graphical-abstract.png)
+![ARGjacent mechanistic workflow](docs/graphical-abstract.png)
 
 ---
 
 ## How It Works
 
-1. **Start from raw reads and target genes.** Give ARGjacent paired short reads (trimmed `.fastq.gz`) and a FASTA of genes you care about (for example, resistance genes found in your sample).
-2. **Pull only nearby reads.** In two fast streaming passes, ARGjacent builds a lightweight map of short DNA anchors around your target genes and keeps only read pairs within your chosen distance (default 10 kb on each side). Most unrelated reads are ignored, so memory stays low.
-3. **Extend outward and prove every base.** Starting from each end of a gene, ARGjacent extends base by base and splits cleanly whenever two different contexts diverge (such as a plasmid copy and a chromosomal copy). It then lays the reads back onto every branch and checks read pairs and read depth to mark the exact distance that is genuinely supported by molecules carrying the gene (`certain_bp`).
-4. **Link both sides and pool cohorts.** For each gene, ARGjacent pairs left and right flanks only when the evidence rules out chimeras, and packs all branches into a compact Bandage-ready graph (`.gfa`). If you have multiple samples, `argjacent-cohort` uses natural abundance differences across samples to pair tied copies without re-reading the FASTQ files.
-
-*(For the full algorithms, statistical proofs, and benchmark tables, see the [validation report](benchmarks/v05_validation/RESULTS.md) and the forthcoming paper.)*
+1. **Minimizer anchor graph and directed outward walk (`aw`, two streaming passes):**
+   Pass 1 scans all paired reads, extracts canonical minimizers (`k=31, w=20`, roughly one anchor per 10.5 bp), discards singleton sequencing errors with a Bloom filter, and records directed edges between consecutive anchors observed in the same read along with their exact base distance and read support. Starting from anchors inside each target gene, ARGjacent walks strictly outward (no backtracking) along these directed links up to distance `D` (default 10 kb per side). At every branch, the gene's read share splits in proportion to link counts, and branches carrying less than `--min-share` (default `0.2%`) are pruned so repeats stay bounded. Pass 2 streams the reads once more and recruits every read pair in which at least one mate hits a reached anchor.
+2. **Variant-aware local extension and branch separation (`awx`):**
+   Starting from each gene end (using both the database reference end and the sample's own inferred terminal 300 bp), ARGjacent extends outward one base at a time from reads overlapping by at least 31 bp. Single-base SNPs, small indels, and short variant patches that reconverge within 31 to 60 bp remain on the same path, and reads differing only at known variant sites stay active (up to 4 sites per read) so they can phase downstream junctions. Sustained structural divergence (plasmid vs chromosome junctions, mobile element boundaries) forks into separate candidate arms (up to `--max-paths`, default 16 per side), explored in order of read share.
+3. **Dual strict and tolerant verification (`awv` + `verify.py`):**
+   All recruited read pairs are mapped back onto every candidate in a single fused strict (exact) and tolerant (SNP/small-indel aware) pass. A position along a flank is certified (`certain_bp`) only if molecules originating in the gene demonstrably continue past all incoming foreign-locus joins, verified by spanning paired-end templates, an own-read budget allowing 20% coverage unevenness, and read depth exceeding incoming foreign joins (with a 30 bp safety margin withheld at the cutoff). When another locus joins inside the gene's final 100 to 300 bp, `certain_end_bp` separately reports how far the flank is certified for genes sharing that terminal 100 bp.
+4. **GFA compaction, two-sided pairing, and cohort deconvolution (`gfa.py`, `pair.py`, `cohort.py`):**
+   Shared candidate prefixes and suffixes are compacted into a round-trip lossless blunt-end (`0M`) GFA v1.0 graph split at exact certainty boundaries (`gene`, `certain`, `end_only`, `candidate`) with 100-bp depth bins (`depth_bins`). Left and right flanks are linked (`[left + gene + right]`) across four strictly ordered tiers: direct read-pair spans across short genes (`<= 650 bp`), phased internal gene SNPs, unbranched (`1x1`) or flow-conserved (`1xk`) splits, and post-fork depth matching requiring 3-sigma separation from competing pairs (abstaining otherwise). Across multiple samples (`argjacent-cohort`), bidirectional weighted non-negative least squares (NNLS) with leave-one-sample-out `Delta chi^2` gating resolves tied-depth pairs (`Part A`, `S >= 2`) and explores post-repeat exits across `>= 400 bp` repeats (`Part B`, `S >= 4`) directly from `flanks.json`.
 
 ---
 
-## Big-Picture Performance
+## Validation Summary
 
-Tested with frozen code against matched **PacBio HiFi** single-molecule long reads from the same DNA samples and official **CAMI II/III** benchmarks:
+Evaluated with frozen `v0.5.0` code against matched single-molecule **PacBio HiFi** long reads from the same DNA samples and official **CAMI II/III** benchmarks:
 
-- **High accuracy where it counts:** **0.33% failed flanks** (`9 / 2,757`) at 1 kb or longer across 21 unseen real metagenomes, compared to **22.5%** for whole-metagenome assembly (MEGAHIT) and **50% or more** for assembly-graph extractors.
-- **No chimeric two-sided pairs on real data:** **0 / 151 chimeric pairs** across 31 real long-read metagenomes (compared to ~17% for naive left-by-right pairing).
-- **Fast and light on RAM:** ~2 to 6 minutes and ~4 to 6 GB RAM for a typical human gut metagenome on a laptop (~20x faster than full assembly).
-- **Scales cleanly to clusters:** Includes ready-to-run Slurm array and cohort scripts in [`hpc/`](hpc/README.md).
+- **Unseen real PacBio HiFi metagenomes (21 samples):** **9 / 2,757 (`0.33%`, 95% CI `0.15-0.62%`)** primary flanks `>= 1 kb` failed strict long-read checks (`0 / 1,388` in Block F native DNA; `9 / 1,369` across 9 additional real gut/mock metagenomes, of which 8 were single 72-80 bp tandem-repeat indels and 1 was a 74-bp structural overshoot).
+- **Head-to-head on 3 real PacBio HiFi metagenomes (`H1`, `B-A2`, `H4`):** **ARGjacent `0 / 834 (0.0%)`** in 9.1 min, vs **ARGextender `11 / 79 (13.9%)`** in 18.2 min, **MEGAHIT `31 / 138 (22.5%)`** in 3 h 43 min, and **ARGContextProfiler / Sarand `50.5-52.0%`**.
+- **CAMI II/III benchmarks (16 samples: Strain Madness, CAMI III Human Gut, Marine):** `1 / 384` unexplained `>= 1 kb` fault groups (`0.26%`) and `0 / 292` failures at `>= 5 kb` on Strain Madness.
+- **Two-sided pairing (31 real PacBio HiFi metagenomes):** **0 / 151 (`0.00%`, 95% CI `0.00-2.41%`)** chimeras at `±500 bp` and **0 / 105 (`0.00%`)** at `±1,000 bp`, vs `16.8%` for Cartesian pairing. Across 18 multi-sample cohort samples, `argjacent-cohort` Part A added **0 / 29** chimeras at `±500 bp` while doubling multi-context recall on Strain Madness (`7.6% -> 14.1%`). Part B post-repeat extension had `0 / 108` false exits on isolated synthetic `IS26` repeats but `23.6%` failures (`35 / 148`) in chained Strain Madness repeats and should be treated as exploratory in dense repeat chains.
+- **Lossless GFA v1.0 compaction (51 metagenomes, 29,720 paths):** `1.60x` sequence compaction with `0` round-trip mismatches.
+
+Full validation protocols, per-sample tables, and forensic checks are in [benchmarks/v05_validation/RESULTS.md](benchmarks/v05_validation/RESULTS.md) and [docs/heldout-validation.md](docs/heldout-validation.md).
 
 ---
 
 ## Install
 
-Requires Python 3.8+, `numpy`, a C compiler (`gcc` or `clang`), and `zlib` headers (`xcode-select --install` on macOS; `apt install gcc zlib1g-dev` on Debian/Ubuntu).
-
-**With `pip` (recommended):**
+Requires Python 3.8+, `numpy >= 1.20`, a C compiler (`gcc` or `clang`), and `zlib` headers (`xcode-select --install` on macOS; `apt install gcc zlib1g-dev` on Debian/Ubuntu).
 
 ```bash
 git clone https://github.com/amulyabaral/argjacent.git
@@ -46,16 +47,18 @@ python3 -m pip install .
 argjacent-selftest
 ```
 
-**Or keep everything inside this folder:**
+To build locally inside the repository folder without pip:
 
 ```bash
 sh install.sh
 sh demo/run_demo.sh
 ```
 
+A Conda build recipe is also provided in `recipe/`.
+
 ---
 
-## Quick Start
+## Usage
 
 ### Single sample
 
@@ -63,43 +66,39 @@ sh demo/run_demo.sh
 argjacent -g genes.fa -1 sample_R1.fastq.gz -2 sample_R2.fastq.gz -o results/sample
 ```
 
-Useful everyday flags: `-D 10000` (flank size per side), `-t 8` (CPU threads), `--max-mem 16` (RAM limit in GB), `-w 40` (uses ~40% less RAM on very deep samples). Run `argjacent -h` to see all options.
+Inputs: paired 4-line FASTQ (plain or `.gz`, adapter-trimmed) and a FASTA of target genes (for example, alleles detected by KMA/ResFinder or a reference gene database). Key options: `-D` flank length per side (default `10000`), `-t` threads, `--max-mem` memory limit in GB, `-w` minimizer window (default `20`), `--max-paths` candidate branches per side (default `16`), `--pair-bp` pairing radius (default `500`), `--save-map` / `--map` to reuse the Pass-1 anchor graph across gene sets. Run `argjacent -h` for all options.
 
-### Multiple samples (cohort pairing)
+### Multi-sample cohort deconvolution
 
 ```bash
 argjacent-cohort \
   -g genes.fa \
   -i results/s1.flanks.json results/s2.flanks.json results/s3.flanks.json \
-  -o results/cohort
+  -o results/cohort \
+  --gfa-dir results/cohort_gfa
 ```
 
-For cohorts where each sample has its own gene list, pass `--sample-sheet samples.tsv`.
+For cohorts with sample-specific gene FASTA files, pass `--sample-sheet samples.tsv` (columns: `sample`, `flanks_json`, optional `genes_fa`, `reads_tsv`).
 
 ### Large runs on a Slurm HPC
 
-See [`hpc/README.md`](hpc/README.md) for a ready-to-run Slurm workflow (`make_samplesheet.py`, `submit_pipeline.sh`, local scratch staging, automatic cohort run, and merged QC summaries).
+Ready-to-run Slurm array and dependent cohort scripts live in [`hpc/`](hpc/README.md) (`make_samplesheet.py`, `submit_pipeline.sh`, `run_array.sbatch`, `run_cohort.sbatch`, `summarize_run.py`).
 
 ---
 
-## Main Outputs
+## Outputs
 
-| File | What is in it |
+| File | Description |
 |---|---|
-| `PREFIX.summary.tsv` | One line per gene side: status, number of neighborhoods found, and longest proven flank (`certain_bp`). |
-| `PREFIX.contexts.tsv` | One line per branch (`c1`, `c2`, ...): total length, proven length, read depth, why it stopped, and nearby genes. |
-| `PREFIX.flanks.fa` | FASTA sequences of all reconstructed flanks. |
-| `PREFIX.pairs.tsv` | Certified two-sided (`left + gene + right`) pairs. |
-| `PREFIX.gfa` | Compact, lossless gene-centered graph ready to open in Bandage. |
-| `PREFIX.flanks.json` | Complete machine-readable record (also used as input to `argjacent-cohort`). |
+| `PREFIX.summary.tsv` | One row per `(gene, side)`: `status`, candidate count, `certain_bp`, `longest_bp`, `read_depth`, `gene_end`, and `certain_end_bp`. |
+| `PREFIX.contexts.tsv` | One row per candidate branch (`c1`, `c2`, ...): `length_bp`, `certain_bp`, `read_depth`, `stop`, `certain_stop`, `other_genes`, `main`, `certain_end_bp`, `shared_end_bp`. |
+| `PREFIX.flanks.fa` | FASTA of all candidate flanking sequences. |
+| `PREFIX.pairs.tsv` | Certified single-sample two-sided `[left + gene + right]` pairings with evidence tier and score. |
+| `PREFIX.gfa` | Lossless compacted gene-centered GFA v1.0 graph with `TP:Z:`, `DP:f:`, and Bandage `CL:Z:` colors. |
+| `PREFIX.flanks.json` | Full machine-readable record including `joins`, `depth_bins`, `gene_depth`, and `pairs` (input to `argjacent-cohort`). |
 
 ---
 
-## Want the Details?
+## License and Citation
 
-- **Expanded v0.5.0 validation (25 CAMI II/III + real HiFi samples):** [benchmarks/v05_validation/RESULTS.md](benchmarks/v05_validation/RESULTS.md) and [PROTOCOL.md](benchmarks/v05_validation/PROTOCOL.md)
-- **Earlier held-out validation history:** [docs/heldout-validation.md](docs/heldout-validation.md)
-- **Slurm HPC guide:** [hpc/README.md](hpc/README.md)
-- **Release history:** [CHANGELOG.md](CHANGELOG.md)
-
-Released under the [MIT License](LICENSE). See [CITATION.cff](CITATION.cff) for citation metadata.
+Released under the [MIT License](LICENSE). See [CITATION.cff](CITATION.cff) for citation metadata and [CHANGELOG.md](CHANGELOG.md) for release notes.
