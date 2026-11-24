@@ -64,6 +64,7 @@ Slurm resources:
   --mem SIZE              RAM per sample task, e.g. 16G, 24G, 48G (default: 24G)
   --time HH:MM:SS         Walltime per sample task (default: 02:00:00)
   --max-concurrent N      Max simultaneous array tasks (default: 20)
+  --cohort-cpus N         CPUs for the post-array cohort+summary job (default: 4)
   --cohort-mem SIZE       RAM for the post-array cohort+summary job (default: 24G)
   --cohort-time HH:MM:SS  Walltime for the post-array cohort+summary job (default: 02:00:00)
 
@@ -95,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         --cpus)             CPUS="$2"; shift 2 ;;
         --mem)              MEM="$2"; shift 2 ;;
         --time)             TIME="$2"; shift 2 ;;
+        --cohort-cpus)      COHORT_CPUS="$2"; shift 2 ;;
         --cohort-mem)       COHORT_MEM="$2"; shift 2 ;;
         --cohort-time)      COHORT_TIME="$2"; shift 2 ;;
         --max-concurrent)   MAX_CONCURRENT="$2"; shift 2 ;;
@@ -244,7 +246,7 @@ echo "  Samples to run : ${N_RUN} / ${N_TOTAL} (array=${ARRAY_SPEC})"
 echo "  Output dir     : ${OUT_ABS}"
 echo "  Gene source    : ${GENES_ABS:-${KMA_DB:-(per-sample genes_fa column)}}"
 echo "  Array resources: ${CPUS} CPUs, ${MEM} RAM, ${TIME} walltime"
-echo "  Cohort job     : $( [[ "$NO_COHORT" == "1" ]] && echo "summary only (--no-cohort)" || echo "argjacent-cohort + summary (${COHORT_MEM} RAM, ${COHORT_TIME})" )"
+echo "  Cohort job     : $( [[ "$NO_COHORT" == "1" ]] && echo "summary only (--no-cohort)" || echo "argjacent-cohort + summary (${COHORT_CPUS} CPUs, ${COHORT_MEM} RAM, ${COHORT_TIME})" )"
 
 if [[ "$DRY_RUN" == "1" ]]; then
     echo ""

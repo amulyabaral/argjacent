@@ -107,7 +107,8 @@ echo "  Completed samples with non-empty genes: ${N_READY}"
 
 # 2. Run argjacent-cohort if requested and >= 2 samples are ready
 if [[ "$SKIP_COHORT" != "1" && "$N_READY" -ge 2 ]]; then
-    CMD=("$COHORT_BIN" --sample-sheet "$COHORT_SHEET" -o "${COHORT_DIR}/cohort" --pair-bp "$COHORT_PAIR_BP")
+    THREADS="${SLURM_CPUS_PER_TASK:-4}"
+    CMD=("$COHORT_BIN" --sample-sheet "$COHORT_SHEET" -o "${COHORT_DIR}/cohort" --pair-bp "$COHORT_PAIR_BP" -t "$THREADS")
     if [[ -n "$GENES_FA" ]]; then
         CMD+=(-g "$GENES_FA")
     fi
