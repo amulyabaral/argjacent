@@ -21,6 +21,8 @@ import math
 import os
 import statistics
 
+import numpy as np
+
 UNEV = 0.18       # calibrated single-molecule log-depth standard deviation across ~1-2 kb
 DEPTH_BIN = 100   # bin width in verify.py's `depth_bins`
 COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
@@ -70,18 +72,20 @@ def seq_sim_fast(a, b):
     L = min(len(a), len(b))
     if L == 0:
         return 1.0
-    direct = sum(x == y for x, y in zip(a[:L], b[:L])) / L
+    aa = np.frombuffer(a[:L].encode("latin-1"), dtype=np.uint8)
+    bb = np.frombuffer(b[:L].encode("latin-1"), dtype=np.uint8)
+    direct = float(np.count_nonzero(aa == bb)) / L
     if direct >= 0.97 or L < 40:
         return direct
     best = direct
     for sh in (-12, -8, -4, -2, -1, 1, 2, 4, 8, 12):
         if sh > 0 and L - sh > 20:
-            m = sum(x == y for x, y in zip(a[:L - sh], b[sh:L])) / (L - sh)
+            m = float(np.count_nonzero(aa[:L - sh] == bb[sh:L])) / (L - sh)
             if m > best:
                 best = m
         elif sh < 0 and L + sh > 20:
             s = -sh
-            m = sum(x == y for x, y in zip(a[s:L], b[:L - s])) / (L - s)
+            m = float(np.count_nonzero(aa[s:L] == bb[:L - s])) / (L - s)
             if m > best:
                 best = m
     return best
@@ -91,19 +95,23 @@ def divergence_bp(out_a, out_b):
     """Outward distance (bp from gene boundary) at which two trunks structurally diverge
     (ignoring isolated 1-bp SNPs by requiring >= 4 mismatches in a 15-bp window)."""
     L = min(len(out_a), len(out_b))
-    diffs = [1 if out_a[i] != out_b[i] else 0 for i in range(L)]
-    win = sum(diffs[:15])
-    if win >= 4:
-        for i in range(min(15, L)):
-            if diffs[i]:
-                return i
-    for i in range(15, L):
-        win += diffs[i] - diffs[i - 15]
-        if win >= 4:
-            for j in range(i - 14, i + 1):
-                if diffs[j]:
-                    return j
-    return L
+    if L == 0:
+        return 0
+    aa = np.frombuffer(out_a[:L].encode("latin-1"), dtype=np.uint8)
+    bb = np.frombuffer(out_b[:L].encode("latin-1"), dtype=np.uint8)
+    diffs = (aa != bb).astype(np.int16)
+    if L < 15:
+        if int(diffs.sum()) >= 4:
+            return int(np.flatnonzero(diffs)[0])
+        return L
+    cs = np.empty(L + 1, dtype=np.int32)
+    cs[0] = 0
+    np.cumsum(diffs, out=cs[1:])
+    hits = np.flatnonzero((cs[15:] - cs[:-15]) >= 4)
+    if hits.size == 0:
+        return L
+    i0 = int(hits[0])
+    return i0 + int(np.flatnonzero(diffs[i0:i0 + 15])[0])
 
 
 def extract_trunks(paths, side, W=500, sim_thr=0.97):

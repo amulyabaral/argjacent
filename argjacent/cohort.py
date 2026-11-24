@@ -15,11 +15,13 @@ be resolved within a single short-read sample:
 """
 import argparse
 import collections
+import concurrent.futures
 import gzip
 import json
 import os
 import statistics
 import sys
+import time
 
 import numpy as np
 
@@ -38,40 +40,167 @@ from .pair import (
 
 
 def _nnls_weighted(A, b, w_sqrt):
-    """Exact active-set Lawson-Hanson NNLS: min_{x >= 0} || diag(w_sqrt) (A x - b) ||_2^2."""
+    """Exact active-set Lawson-Hanson NNLS: min_{x >= 0} || diag(w_sqrt) (A x - b) ||_2^2.
+
+    For nonnegative A, b, any column j with zero overlap with {i : b[i] > 0} has
+    gradient Aw[:, j]^T (bw - Aw x) = -Aw[:, j]^T (Aw x) <= 0 for all x >= 0 and
+    can never enter the active set; pruning those columns (and all-zero rows) plus
+    using Gram-Cholesky solves with SVD fallback gives identical solutions orders
+    of magnitude faster on sparse large-cohort matrices.
+    """
     Aw = A * w_sqrt[:, None]
     bw = b * w_sqrt
     n = Aw.shape[1]
     if n == 0:
-        return np.zeros(0), float(np.sum(bw ** 2))
-    P_set = np.zeros(n, dtype=bool)
-    x = np.zeros(n, dtype=np.float64)
-    w_grad = Aw.T @ (bw - Aw @ x)
+        return np.zeros(0, dtype=np.float64), float(np.sum(bw ** 2))
+    b_pos = bw > 0.0
+    if not np.any(b_pos):
+        return np.zeros(n, dtype=np.float64), 0.0
+    if np.all(Aw >= 0.0):
+        cols = np.nonzero(np.any(Aw[b_pos] > 0.0, axis=0))[0]
+    else:
+        cols = np.arange(n)
+    if cols.size == 0:
+        return np.zeros(n, dtype=np.float64), float(np.sum(bw ** 2))
+    Aw_s = Aw[:, cols]
+    row_mask = b_pos | np.any(Aw_s != 0.0, axis=1)
+    Aw_s = Aw_s[row_mask]
+    bw_s = bw[row_mask]
+    m = cols.size
+
+    G = Aw_s.T @ Aw_s
+    c = Aw_s.T @ bw_s
+    P_set = np.zeros(m, dtype=bool)
+    x_s = np.zeros(m, dtype=np.float64)
+    w_grad = c.copy()
     it = 0
-    while np.any((~P_set) & (w_grad > 1e-9)) and it < 5 * n + 20:
+    while np.any((~P_set) & (w_grad > 1e-9)) and it < 5 * m + 20:
         it += 1
         j = int(np.argmax(np.where(~P_set, w_grad, -1e30)))
         P_set[j] = True
         while True:
             idx = np.nonzero(P_set)[0]
-            if len(idx) == 0:
+            if idx.size == 0:
                 break
-            Ap = Aw[:, idx]
-            sp, _, _, _ = np.linalg.lstsq(Ap, bw, rcond=1e-10)
+            sp = None
+            try:
+                L = np.linalg.cholesky(G[np.ix_(idx, idx)])
+                diag = np.diag(L)
+                if np.min(diag) > 1e-7 * np.max(diag):
+                    y = np.linalg.solve(L, c[idx])
+                    sp = np.linalg.solve(L.T, y)
+            except np.linalg.LinAlgError:
+                pass
+            if sp is None:
+                sp, _, _, _ = np.linalg.lstsq(Aw_s[:, idx], bw_s, rcond=1e-10)
             if np.all(sp > 1e-10):
-                x[:] = 0.0
-                x[idx] = sp
+                x_s[:] = 0.0
+                x_s[idx] = sp
                 break
             neg = sp <= 1e-10
-            alphas = x[idx][neg] / (x[idx][neg] - sp[neg] + 1e-30)
+            alphas = x_s[idx][neg] / (x_s[idx][neg] - sp[neg] + 1e-30)
             alpha = float(np.min(alphas))
-            x_new = np.zeros(n)
-            x_new[idx] = x[idx] + alpha * (sp - x[idx])
-            x = np.maximum(0.0, x_new)
-            P_set[idx[x[idx] <= 1e-10]] = False
-        w_grad = Aw.T @ (bw - Aw @ x)
-    res = float(np.sum((bw - Aw @ x) ** 2))
+            x_new = np.zeros(m, dtype=np.float64)
+            x_new[idx] = x_s[idx] + alpha * (sp - x_s[idx])
+            x_s = np.maximum(0.0, x_new)
+            P_set[idx[x_s[idx] <= 1e-10]] = False
+        idx = np.nonzero(P_set)[0]
+        w_grad = (c - G[:, idx] @ x_s[idx]) if idx.size else c.copy()
+    idx = np.nonzero(P_set)[0]
+    res = float(np.sum((bw_s - Aw_s[:, idx] @ x_s[idx]) ** 2)) if idx.size else float(np.sum(bw_s ** 2))
+    x = np.zeros(n, dtype=np.float64)
+    x[cols] = x_s
     return x, res
+
+
+class _ExactSeqClusters:
+    """Bit-for-bit exact greedy first-match clusterer for `seq_sim_fast(seq, c) >= thr`.
+
+    Stores cluster representatives in a single 0-padded uint8 matrix so each query
+    checks all existing clusters via vectorized NumPy comparisons while preserving
+    exact first-match insertion order and shift semantics.
+    """
+
+    def __init__(self, max_len=500, thr=0.96):
+        self.max_len = max(1, int(max_len))
+        self.thr = float(thr)
+        self.seqs = []
+        self.items = []
+        self.cap = 64
+        self.cnt = 0
+        self.mat = np.zeros((self.cap, self.max_len), dtype=np.uint8)
+        self.lens = np.zeros(self.cap, dtype=np.int32)
+
+    def _grow_cols(self, new_len):
+        nmat = np.zeros((self.cap, new_len), dtype=np.uint8)
+        nmat[:, :self.max_len] = self.mat
+        self.mat = nmat
+        self.max_len = new_len
+
+    def match_or_add(self, seq, payload, add=True):
+        L = len(seq)
+        if L > self.max_len:
+            self._grow_cols(L)
+        aa = np.frombuffer(seq.encode("latin-1"), dtype=np.uint8)
+        if self.cnt > 0:
+            M = self.mat[:self.cnt, :L]
+            mL = np.minimum(self.lens[:self.cnt], L)
+            zero_hit = np.flatnonzero(mL == 0)
+            best = int(zero_hit[0]) if zero_hit.size else None
+            direct = np.count_nonzero(M == aa, axis=1) if L > 0 else np.zeros(self.cnt, dtype=np.int64)
+            hits = np.flatnonzero((mL > 0) & (direct >= self.thr * mL))
+            if hits.size:
+                h = int(hits[0])
+                if best is None or h < best:
+                    best = h
+            lim = self.cnt if best is None else best
+            if lim > 0 and L >= 40:
+                M_lim = M[:lim]
+                mL_lim = mL[:lim]
+                lens_lim = self.lens[:lim]
+                valid40 = mL_lim >= 40
+                if np.any(valid40):
+                    for sh in (-12, -8, -4, -2, -1, 1, 2, 4, 8, 12):
+                        if sh > 0 and L - sh > 20:
+                            eff = mL_lim - sh
+                            cnts = np.count_nonzero(M_lim[:, sh:L] == aa[:L - sh], axis=1)
+                            hs = np.flatnonzero(valid40 & (eff > 20) & (cnts >= self.thr * eff))
+                            if hs.size:
+                                h = int(hs[0])
+                                if best is None or h < best:
+                                    best = h
+                        elif sh < 0 and L + sh > 20:
+                            s = -sh
+                            eff = mL_lim - s
+                            cnts = np.count_nonzero(M_lim[:, :L - s] == aa[s:L], axis=1)
+                            hs = np.flatnonzero(valid40 & (eff > 20) & (cnts >= self.thr * eff))
+                            for h_arr in hs:
+                                h = int(h_arr)
+                                if best is not None and h >= best:
+                                    break
+                                if lens_lim[h] >= L or seq_sim_fast(seq, self.seqs[h]) >= self.thr:
+                                    best = h
+                                    break
+            if best is not None:
+                return best
+        if not add:
+            return None
+        idx = self.cnt
+        if idx == self.cap:
+            self.cap *= 2
+            nmat = np.zeros((self.cap, self.max_len), dtype=np.uint8)
+            nmat[:idx] = self.mat
+            self.mat = nmat
+            nlens = np.zeros(self.cap, dtype=np.int32)
+            nlens[:idx] = self.lens
+            self.lens = nlens
+        if L > 0:
+            self.mat[idx, :L] = aa
+        self.lens[idx] = L
+        self.seqs.append(seq)
+        self.items.append(payload)
+        self.cnt += 1
+        return idx
 
 
 # ==============================================================================
@@ -112,27 +241,41 @@ def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_m
     if len(sample_reps) < 2:
         return per_sg_single
 
-    U_clusters, V_clusters = [], []
-
-    def assign_cluster(out_s, prox_s, clist):
-        for idx, c in enumerate(clist):
-            if seq_sim_fast(out_s, c["out"]) >= 0.96:
-                return idx
-        clist.append({"out": out_s, "prox": prox_s})
-        return len(clist) - 1
+    U_cl = _ExactSeqClusters(max_len=W, thr=0.96)
+    V_cl = _ExactSeqClusters(max_len=W, thr=0.96)
 
     valid_rows = []
     for sid, best_g, fam_genes, l_all, r_all, sp in sample_reps:
         max_d = max(max(t["depth"] for t in l_all), max(t["depth"] for t in r_all))
         l_maj = [t for t in l_all if t["depth"] >= 0.05 * max_d]
         r_maj = [t for t in r_all if t["depth"] >= 0.05 * max_d]
-        l_map = {t["trunk_id"]: assign_cluster(t["out"], t["prox"], U_clusters) for t in l_all}
-        r_map = {t["trunk_id"]: assign_cluster(t["out"], t["prox"], V_clusters) for t in r_all}
+        l_map = {t["trunk_id"]: U_cl.match_or_add(t["out"], {"out": t["out"], "prox": t["prox"]}) for t in l_all}
+        r_map = {t["trunk_id"]: V_cl.match_or_add(t["out"], {"out": t["out"], "prox": t["prox"]}) for t in r_all}
         excl_ok = all(t["exclusive_depth_known"] for t in l_maj + r_maj)
         valid_rows.append((sid, best_g, fam_genes, l_all, r_all, l_map, r_map, excl_ok))
 
-    P, Q = len(U_clusters), len(V_clusters)
+    P, Q = U_cl.cnt, V_cl.cnt
     if P == 0 or Q == 0:
+        return per_sg_single
+
+    # Compute co_present and single-sample anchors before NNLS so clusters/families with
+    # no co_present >= 2 pairs skip underdetermined NNLS + LOO solves completely.
+    anchored = collections.Counter()
+    co_present = np.zeros((P, Q), dtype=int)
+    for sid, best_g, _, l_all, r_all, l_map, r_map, _ in valid_rows:
+        u_here = {l_map[t["trunk_id"]] for t in l_all if t["depth"] >= 8.0 and t["certain_bp"] >= W and t["shared_end"] == 0}
+        v_here = {r_map[t["trunk_id"]] for t in r_all if t["depth"] >= 8.0 and t["certain_bp"] >= W and t["shared_end"] == 0}
+        for a in u_here:
+            for b in v_here:
+                co_present[a, b] += 1
+        for pr in per_sg_single[sid].get(best_g, []):
+            a = l_map.get(pr["left_trunk"])
+            b = r_map.get(pr["right_trunk"])
+            if a is not None and b is not None:
+                anchored[(a, b)] += 1
+
+    need_pair = co_present >= 2
+    if not np.any(need_pair):
         return per_sg_single
 
     reg_rows = [r for r in valid_rows if r[7]]
@@ -153,7 +296,10 @@ def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_m
     loo_rev = np.zeros((P, Q), dtype=np.float64)
 
     if Sr >= 2:
+        co_excl_mat = (X >= 8.0).T.astype(np.int32) @ (Y >= 8.0).astype(np.int32)
         for b in range(Q):
+            if not np.any(need_pair[:, b]):
+                continue
             yb = Y[:, b]
             if np.sum(yb > 5.0) < 1:
                 continue
@@ -163,23 +309,31 @@ def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_m
             w_full, res_full = _nnls_weighted(X, yb, w_sqrt)
             W_fwd[:, b] = w_full
             for a in range(P):
-                if w_full[a] < 0.25:
+                if w_full[a] < 0.25 or not need_pair[a, b]:
                     continue
                 X_null = X.copy()
                 X_null[:, a] = 0.0
                 _, res_null = _nnls_weighted(X_null, yb, w_sqrt)
-                dchi2_fwd[a, b] = max(0.0, res_null - res_full)
-                if Sr >= 3:
-                    best_drop = dchi2_fwd[a, b]
-                    active_s = [s for s in range(Sr) if X[s, a] > 5.0 or yb[s] > 5.0]
+                dc = max(0.0, res_null - res_full)
+                dchi2_fwd[a, b] = dc
+                if Sr >= 3 and co_excl_mat[a, b] >= 2 and dc >= loo_chi2_min:
+                    best_drop = dc
+                    active_s = sorted(
+                        (s for s in range(Sr) if X[s, a] > 5.0 or yb[s] > 5.0),
+                        key=lambda s: -min(X[s, a], yb[s]),
+                    )
                     for drop_s in active_s:
                         keep = [s for s in range(Sr) if s != drop_s]
                         _, rf = _nnls_weighted(X[keep], yb[keep], w_sqrt[keep])
                         _, rn = _nnls_weighted(X_null[keep], yb[keep], w_sqrt[keep])
                         best_drop = min(best_drop, max(0.0, rn - rf))
+                        if best_drop < loo_chi2_min:
+                            break
                     loo_fwd[a, b] = best_drop
 
         for a in range(P):
+            if not np.any(need_pair[a, :]):
+                continue
             xa = X[:, a]
             if np.sum(xa > 5.0) < 1:
                 continue
@@ -189,35 +343,27 @@ def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_m
             w_full, res_full = _nnls_weighted(Y, xa, w_sqrt)
             W_rev[:, a] = w_full
             for b in range(Q):
-                if w_full[b] < 0.25:
+                if w_full[b] < 0.25 or not need_pair[a, b]:
                     continue
                 Y_null = Y.copy()
                 Y_null[:, b] = 0.0
                 _, res_null = _nnls_weighted(Y_null, xa, w_sqrt)
-                dchi2_rev[a, b] = max(0.0, res_null - res_full)
-                if Sr >= 3:
-                    best_drop = dchi2_rev[a, b]
-                    active_s = [s for s in range(Sr) if Y[s, b] > 5.0 or xa[s] > 5.0]
+                dc = max(0.0, res_null - res_full)
+                dchi2_rev[a, b] = dc
+                if Sr >= 3 and co_excl_mat[a, b] >= 2 and dc >= loo_chi2_min:
+                    best_drop = dc
+                    active_s = sorted(
+                        (s for s in range(Sr) if Y[s, b] > 5.0 or xa[s] > 5.0),
+                        key=lambda s: -min(Y[s, b], xa[s]),
+                    )
                     for drop_s in active_s:
                         keep = [s for s in range(Sr) if s != drop_s]
                         _, rf = _nnls_weighted(Y[keep], xa[keep], w_sqrt[keep])
                         _, rn = _nnls_weighted(Y_null[keep], xa[keep], w_sqrt[keep])
                         best_drop = min(best_drop, max(0.0, rn - rf))
+                        if best_drop < loo_chi2_min:
+                            break
                     loo_rev[a, b] = best_drop
-
-    anchored = collections.Counter()
-    co_present = np.zeros((P, Q), dtype=int)
-    for sid, best_g, _, l_all, r_all, l_map, r_map, _ in valid_rows:
-        u_here = {l_map[t["trunk_id"]] for t in l_all if t["depth"] >= 8.0 and t["certain_bp"] >= W and t["shared_end"] == 0}
-        v_here = {r_map[t["trunk_id"]] for t in r_all if t["depth"] >= 8.0 and t["certain_bp"] >= W and t["shared_end"] == 0}
-        for a in u_here:
-            for b in v_here:
-                co_present[a, b] += 1
-        for pr in per_sg_single[sid].get(best_g, []):
-            a = l_map.get(pr["left_trunk"])
-            b = r_map.get(pr["right_trunk"])
-            if a is not None and b is not None:
-                anchored[(a, b)] += 1
 
     cohort_links = {}
     for a in range(P):
@@ -258,16 +404,14 @@ def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_m
 
             lm = {}
             for t in l_tr:
-                for ui, uc in enumerate(U_clusters):
-                    if seq_sim_fast(t["out"], uc["out"]) >= 0.96:
-                        lm[t["trunk_id"]] = ui
-                        break
+                ui = U_cl.match_or_add(t["out"], None, add=False)
+                if ui is not None:
+                    lm[t["trunk_id"]] = ui
             rm = {}
             for t in r_tr:
-                for vi, vc in enumerate(V_clusters):
-                    if seq_sim_fast(t["out"], vc["out"]) >= 0.96:
-                        rm[t["trunk_id"]] = vi
-                        break
+                vi = V_cl.match_or_add(t["out"], None, add=False)
+                if vi is not None:
+                    rm[t["trunk_id"]] = vi
 
             def _append_pair(lt, rt, tier, sc, note):
                 pr = {
@@ -348,16 +492,47 @@ def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_m
     return per_sg_single
 
 
-def cohort_pair_all(samples_data, W=500, include_prox=False):
+def _pair_family_worker(task):
+    fam_samples, fam, W, include_prox = task
+    return fam, dict(cohort_pair_family(fam_samples, fam, W=W, include_prox=include_prox))
+
+
+def cohort_pair_all(samples_data, W=500, include_prox=False, threads=1):
     """Run cohort pairing across all gene families in `samples_data`."""
     fams = sorted({g.split("_")[0] for sd in samples_data for g in sd["doc"].get("genes", {})})
     out = {sd["sid"]: {} for sd in samples_data}
-    for fam in fams:
-        res = cohort_pair_family(samples_data, fam, W=W, include_prox=include_prox)
-        for sid, gmap in res.items():
-            for g, plist in gmap.items():
-                if plist:
-                    out[sid][g] = plist
+    if threads > 1 and len(fams) > 1:
+        tasks = []
+        for fam in fams:
+            fam_samples = []
+            for sd in samples_data:
+                doc_genes = sd["doc"].get("genes", {})
+                fgenes = {g: doc_genes[g] for g in doc_genes if g.split("_")[0] == fam and g in sd["genes"]}
+                if not fgenes:
+                    continue
+                entry = {
+                    "sid": sd["sid"],
+                    "genes": {g: sd["genes"][g] for g in fgenes},
+                    "doc": {"genes": fgenes},
+                }
+                if "pre_phased" in sd:
+                    entry["pre_phased"] = {g: sd["pre_phased"][g] for g in fgenes if g in sd["pre_phased"]}
+                fam_samples.append(entry)
+            tasks.append((fam_samples, fam, W, include_prox))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(tasks))) as ex:
+            results = list(ex.map(_pair_family_worker, tasks))
+        for _, res in results:
+            for sid, gmap in res.items():
+                for g, plist in gmap.items():
+                    if plist:
+                        out[sid][g] = plist
+    else:
+        for fam in fams:
+            res = cohort_pair_family(samples_data, fam, W=W, include_prox=include_prox)
+            for sid, gmap in res.items():
+                for g, plist in gmap.items():
+                    if plist:
+                        out[sid][g] = plist
     return out
 
 
@@ -522,13 +697,16 @@ def cohort_deconvolve_repeats(samples_data, gene_name, side, min_repeat_bp=400, 
     if len(active_samples) < 4 or not fork_votes:
         return {}
     fork_bp = int(min(fork_votes))
+    ex_cl = _ExactSeqClusters(max_len=400, thr=0.96)
 
     for sd, gseq, paths, outs in active_samples:
         for p, out in outs:
             if len(out) < fork_bp + 300:
                 continue
             pseq = out[fork_bp:fork_bp + 400]
-            if not any(seq_sim_fast(pseq, cl["post_seq"]) >= 0.96 for cl in exit_clusters):
+            prev_cnt = ex_cl.cnt
+            ex_cl.match_or_add(pseq, None, add=True)
+            if ex_cl.cnt > prev_cnt:
                 exit_clusters.append({
                     "id": "E%d" % len(exit_clusters),
                     "flank": p["flank"],
@@ -549,10 +727,9 @@ def cohort_deconvolve_repeats(samples_data, gene_name, side, min_repeat_bp=400, 
         for p, out in outs:
             if len(out) >= fork_bp + 250:
                 pseq = out[fork_bp:fork_bp + 400]
-                for m_idx, cl in enumerate(exit_clusters):
-                    if seq_sim_fast(pseq, cl["post_seq"]) >= 0.96 and m_idx not in own_cand:
-                        own_cand[m_idx] = p
-                        break
+                m_idx = ex_cl.match_or_add(pseq, None, add=False)
+                if m_idx is not None and m_idx not in own_cand:
+                    own_cand[m_idx] = p
         if all_have_reads:
             g_depth, cstats = _measure_repeat_from_reads(gseq, synth_paths, side, sd["reads_tsv"], fork_bp, target_bp=target_bp)
             source_mode = "reads_tsv"
@@ -638,11 +815,14 @@ def cohort_deconvolve_repeats(samples_data, gene_name, side, min_repeat_bp=400, 
         if dchi2 < delta_chi2_min:
             continue
         loo_min = dchi2
-        for drop_s in range(Sf):
+        drop_order = sorted(range(Sf), key=lambda s: -Y_fit[s, m])
+        for drop_s in drop_order:
             keep = [s for s in range(Sf) if s != drop_s]
             _, rf = _nnls_weighted(Y_fit[keep], g_fit[keep], w_fit[keep])
             _, rn = _nnls_weighted(Y_null[keep], g_fit[keep], w_fit[keep])
             loo_min = min(loo_min, max(0.0, rn - rf))
+            if loo_min < loo_chi2_min:
+                break
         if loo_min >= loo_chi2_min:
             validated_exits[m] = {"w": round(wm, 3), "dChi2": round(dchi2, 2), "loo_dChi2": round(loo_min, 2), "n_samples": n_act}
 
@@ -683,16 +863,58 @@ def cohort_deconvolve_repeats(samples_data, gene_name, side, min_repeat_bp=400, 
     return resolved
 
 
-def cohort_deconvolve_all_repeats(samples_data, min_repeat_bp=400, target_bp=5000):
+def _deconvolve_repeat_worker(task):
+    gene_samples, gname, side, min_repeat_bp, target_bp = task
+    return gname, side, cohort_deconvolve_repeats(
+        gene_samples, gname, side, min_repeat_bp=min_repeat_bp, target_bp=target_bp
+    )
+
+
+def cohort_deconvolve_all_repeats(samples_data, min_repeat_bp=400, target_bp=5000, threads=1):
     """Run post-repeat deconvolution across every `(gene, side)` present in `>= 4` samples."""
     gene_counts = collections.Counter(g for sd in samples_data for g in sd["doc"].get("genes", {}))
     out = collections.defaultdict(lambda: collections.defaultdict(dict))
-    for gname in sorted(g for g, c in gene_counts.items() if c >= 4):
-        for side in ("left", "right"):
-            res = cohort_deconvolve_repeats(samples_data, gname, side, min_repeat_bp=min_repeat_bp, target_bp=target_bp)
+    cand_genes = sorted(g for g, c in gene_counts.items() if c >= 4)
+    if threads > 1 and cand_genes:
+        tasks = []
+        for gname in cand_genes:
+            for side in ("left", "right"):
+                gene_samples = []
+                for sd in samples_data:
+                    gseq = sd["genes"].get(gname)
+                    gent = sd["doc"].get("genes", {}).get(gname)
+                    if not gseq or not gent:
+                        continue
+                    gene_samples.append({
+                        "sid": sd["sid"],
+                        "genes": {gname: gseq},
+                        "doc": {"genes": {gname: {side: gent.get(side, {})}}},
+                        "reads_tsv": sd.get("reads_tsv"),
+                    })
+                tasks.append((gene_samples, gname, side, min_repeat_bp, target_bp))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(tasks))) as ex:
+            results = list(ex.map(_deconvolve_repeat_worker, tasks))
+        for gname, side, res in results:
             for sid, exts in res.items():
                 out[sid][gname][side] = exts
+    else:
+        for gname in cand_genes:
+            for side in ("left", "right"):
+                res = cohort_deconvolve_repeats(samples_data, gname, side, min_repeat_bp=min_repeat_bp, target_bp=target_bp)
+                for sid, exts in res.items():
+                    out[sid][gname][side] = exts
     return {sid: dict(gmap) for sid, gmap in out.items()}
+
+
+def _gfa_export_worker(task):
+    genes, doc_genes, out_path, pairs_by_gene, cohort_exts_by_gene = task
+    write_gfa(
+        genes, doc_genes, out_path,
+        pairs_by_gene=pairs_by_gene,
+        cohort_exts_by_gene=cohort_exts_by_gene,
+        verify=True,
+    )
+    return out_path
 
 
 # ==============================================================================
@@ -769,20 +991,34 @@ def main(argv=None):
     ap.add_argument("--min-repeat-bp", type=int, default=400, help="minimum shared repeat length for post-repeat deconvolution (default 400)")
     ap.add_argument("--target-bp", type=int, default=5000, help="maximum outward distance for post-repeat cohort certification (default 5000)")
     ap.add_argument("--gfa-dir", metavar="DIR", help="optional directory to write updated per-sample GFA v1.0 graphs with cohort paths")
+    ap.add_argument("-t", "--threads", type=int, default=1, help="worker processes for cohort pairing, repeat deconvolution, and GFA export (default 1)")
     ap.add_argument("-v", "--version", action="version", version="argjacent-cohort (argjacent %s)" % VERSION)
     args = ap.parse_args(argv)
+    threads = max(1, int(args.threads))
 
+    t0 = time.time()
     samples = _load_cohort_inputs(args)
     if len(samples) < 2:
         sys.stderr.write("argjacent-cohort: at least 2 samples are required (got %d)\n" % len(samples))
         return 1
+    sys.stderr.write("argjacent-cohort: loaded %d samples in %.1fs (threads=%d)\n" % (len(samples), time.time() - t0, threads))
+    sys.stderr.flush()
 
     out_dir = os.path.dirname(os.path.abspath(args.out))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    pairs_by_sid = cohort_pair_all(samples, W=args.pair_bp)
-    repeats_by_sid = cohort_deconvolve_all_repeats(samples, min_repeat_bp=args.min_repeat_bp, target_bp=args.target_bp)
+    t_a = time.time()
+    pairs_by_sid = cohort_pair_all(samples, W=args.pair_bp, threads=threads)
+    sys.stderr.write("argjacent-cohort: Part A (two-sided pairing) finished in %.1fs\n" % (time.time() - t_a))
+    sys.stderr.flush()
+
+    t_b = time.time()
+    repeats_by_sid = cohort_deconvolve_all_repeats(
+        samples, min_repeat_bp=args.min_repeat_bp, target_bp=args.target_bp, threads=threads
+    )
+    sys.stderr.write("argjacent-cohort: Part B (post-repeat exits) finished in %.1fs\n" % (time.time() - t_b))
+    sys.stderr.flush()
 
     n_pairs = n_cohort_pairs = 0
     with open(args.out + ".cohort_pairs.tsv", "w") as f:
@@ -829,16 +1065,30 @@ def main(argv=None):
         }, f, indent=1)
 
     if args.gfa_dir:
+        t_g = time.time()
         os.makedirs(args.gfa_dir, exist_ok=True)
-        for sd in samples:
-            sid = sd["sid"]
-            write_gfa(
-                sd["genes"], sd["doc"].get("genes", {}),
-                os.path.join(args.gfa_dir, sid + ".gfa"),
-                pairs_by_gene=pairs_by_sid.get(sid, {}),
-                cohort_exts_by_gene=repeats_by_sid.get(sid, {}),
-                verify=True,
-            )
+        if threads > 1 and len(samples) > 1:
+            gfa_tasks = [
+                (sd["genes"], sd["doc"].get("genes", {}),
+                 os.path.join(args.gfa_dir, sd["sid"] + ".gfa"),
+                 pairs_by_sid.get(sd["sid"], {}),
+                 repeats_by_sid.get(sd["sid"], {}))
+                for sd in samples
+            ]
+            with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(gfa_tasks))) as ex:
+                list(ex.map(_gfa_export_worker, gfa_tasks))
+        else:
+            for sd in samples:
+                sid = sd["sid"]
+                write_gfa(
+                    sd["genes"], sd["doc"].get("genes", {}),
+                    os.path.join(args.gfa_dir, sid + ".gfa"),
+                    pairs_by_gene=pairs_by_sid.get(sid, {}),
+                    cohort_exts_by_gene=repeats_by_sid.get(sid, {}),
+                    verify=True,
+                )
+        sys.stderr.write("argjacent-cohort: wrote %d GFA files in %.1fs\n" % (len(samples), time.time() - t_g))
+        sys.stderr.flush()
 
     print("argjacent-cohort %s: %d samples | %d certified two-sided pairs (%d newly resolved by cohort) | %d post-repeat exits certified" % (
         VERSION, len(samples), n_pairs, n_cohort_pairs, n_rep))
