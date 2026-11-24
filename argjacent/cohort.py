@@ -18,6 +18,7 @@ import collections
 import concurrent.futures
 import gzip
 import json
+import multiprocessing
 import os
 import statistics
 import sys
@@ -53,17 +54,18 @@ def _nnls_weighted(A, b, w_sqrt):
     n = Aw.shape[1]
     if n == 0:
         return np.zeros(0, dtype=np.float64), float(np.sum(bw ** 2))
+    nonneg = bool(np.all(Aw >= 0.0) and np.all(bw >= 0.0))
     b_pos = bw > 0.0
-    if not np.any(b_pos):
-        return np.zeros(n, dtype=np.float64), 0.0
-    if np.all(Aw >= 0.0):
+    if nonneg:
+        if not np.any(b_pos):
+            return np.zeros(n, dtype=np.float64), 0.0
         cols = np.nonzero(np.any(Aw[b_pos] > 0.0, axis=0))[0]
     else:
         cols = np.arange(n)
     if cols.size == 0:
         return np.zeros(n, dtype=np.float64), float(np.sum(bw ** 2))
     Aw_s = Aw[:, cols]
-    row_mask = b_pos | np.any(Aw_s != 0.0, axis=1)
+    row_mask = (bw != 0.0) | np.any(Aw_s != 0.0, axis=1)
     Aw_s = Aw_s[row_mask]
     bw_s = bw[row_mask]
     m = cols.size
@@ -519,7 +521,8 @@ def cohort_pair_all(samples_data, W=500, include_prox=False, threads=1):
                     entry["pre_phased"] = {g: sd["pre_phased"][g] for g in fgenes if g in sd["pre_phased"]}
                 fam_samples.append(entry)
             tasks.append((fam_samples, fam, W, include_prox))
-        with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(tasks))) as ex:
+        mp_ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(tasks)), mp_context=mp_ctx) as ex:
             results = list(ex.map(_pair_family_worker, tasks))
         for _, res in results:
             for sid, gmap in res.items():
@@ -728,8 +731,14 @@ def cohort_deconvolve_repeats(samples_data, gene_name, side, min_repeat_bp=400, 
             if len(out) >= fork_bp + 250:
                 pseq = out[fork_bp:fork_bp + 400]
                 m_idx = ex_cl.match_or_add(pseq, None, add=False)
-                if m_idx is not None and m_idx not in own_cand:
-                    own_cand[m_idx] = p
+                if m_idx is not None:
+                    if m_idx not in own_cand:
+                        own_cand[m_idx] = p
+                    else:
+                        for m2 in range(m_idx + 1, len(exit_clusters)):
+                            if m2 not in own_cand and seq_sim_fast(pseq, exit_clusters[m2]["post_seq"]) >= 0.96:
+                                own_cand[m2] = p
+                                break
         if all_have_reads:
             g_depth, cstats = _measure_repeat_from_reads(gseq, synth_paths, side, sd["reads_tsv"], fork_bp, target_bp=target_bp)
             source_mode = "reads_tsv"
@@ -892,7 +901,8 @@ def cohort_deconvolve_all_repeats(samples_data, min_repeat_bp=400, target_bp=500
                         "reads_tsv": sd.get("reads_tsv"),
                     })
                 tasks.append((gene_samples, gname, side, min_repeat_bp, target_bp))
-        with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(tasks))) as ex:
+        mp_ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(tasks)), mp_context=mp_ctx) as ex:
             results = list(ex.map(_deconvolve_repeat_worker, tasks))
         for gname, side, res in results:
             for sid, exts in res.items():
@@ -1075,7 +1085,8 @@ def main(argv=None):
                  repeats_by_sid.get(sd["sid"], {}))
                 for sd in samples
             ]
-            with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(gfa_tasks))) as ex:
+            mp_ctx = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(gfa_tasks)), mp_context=mp_ctx) as ex:
                 list(ex.map(_gfa_export_worker, gfa_tasks))
         else:
             for sd in samples:
