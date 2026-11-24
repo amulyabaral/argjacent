@@ -38,3 +38,4 @@ benchmarks/v05_validation/results/
 benchmarks/v05_validation/__pycache__/
 docs/*
 !docs/heldout-validation.md
+!docs/graphical-abstract.png
