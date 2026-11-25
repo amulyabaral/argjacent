@@ -39,7 +39,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
-#define AWX_VERSION "0.4.1"
+#define AWX_VERSION "0.5.1"
 #define K 31
 #define SAMP 8
 #define QMIN 15

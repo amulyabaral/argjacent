@@ -685,7 +685,11 @@ def run(a, bins, genes, tmp):
 
     gfa_st = None
     if not a.no_gfa:
-        gfa_st = gfa.write_gfa(genes_dict, doc_genes, a.out + ".gfa", pairs_by_gene=pairs_by_gene, verify=True)
+        gfa_st = gfa.write_gfa(
+            genes_dict, doc_genes, a.out + ".gfa",
+            pairs_by_gene=pairs_by_gene, verify=True,
+            read_len=(read_len if read_len else 150),
+        )
 
     n_pairs = sum(len(v) for v in pairs_by_gene.values())
     with open(log_path, "a") as log:

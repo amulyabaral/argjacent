@@ -1,8 +1,8 @@
 cff-version: 1.2.0
 message: "If you use ARGjacent in your research, please cite it as below."
 title: "ARGjacent: Certified genomic contexts of genes from paired short reads without assembly"
-version: "0.5.0"
-date-released: "2026-11-22"
+version: "0.5.1"
+date-released: "2026-11-25"
 license: MIT
 repository-code: "https://github.com/amulyabaral/argjacent"
 authors:

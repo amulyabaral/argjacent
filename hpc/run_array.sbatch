@@ -198,7 +198,8 @@ PY
         printf "gene\tside\tcontext\tlength_bp\tcertain_bp\tread_depth\tstop\tcertain_stop\tother_genes\tgene_end\tmain\tcertain_end_bp\tshared_end_bp\n" > "${SAMPLE_OUT_DIR}/${SAMPLE}.contexts.tsv"
         : > "${SAMPLE_OUT_DIR}/${SAMPLE}.flanks.fa"
         printf "gene\tpair_id\tleft_context\tright_context\tleft_certain_bp\tright_certain_bp\tleft_depth\tright_depth\ttier\tscore\tnote\n" > "${SAMPLE_OUT_DIR}/${SAMPLE}.pairs.tsv"
-        printf '{"version": "0.5.0", "flank_bp": 10000, "aw_stats": {}, "parameters": {}, "genes": {}}\n' > "${SAMPLE_OUT_DIR}/${SAMPLE}.flanks.json"
+        ARGJ_VER="$("$ARGJACENT" --version 2>/dev/null | awk '{print $2}' || echo "0.5.1")"
+        printf '{"version": "%s", "flank_bp": 10000, "aw_stats": {}, "parameters": {}, "genes": {}}\n' "${ARGJ_VER:-0.5.1}" > "${SAMPLE_OUT_DIR}/${SAMPLE}.flanks.json"
         printf "argjacent hpc: 0 genes detected by KMA pre-screen\n" > "${SAMPLE_OUT_DIR}/${SAMPLE}.log"
         date -u +"%Y-%m-%dT%H:%M:%SZ" > "$DONE_MARK"
         exit 0

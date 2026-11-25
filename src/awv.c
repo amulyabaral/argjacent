@@ -21,7 +21,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <pthread.h>
-#define AWV_VERSION "0.4.1"
+#define AWV_VERSION "0.5.1"
 #define K 21
 #define NW 4
 #define NARR 20

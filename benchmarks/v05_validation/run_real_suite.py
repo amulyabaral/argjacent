@@ -38,13 +38,13 @@ from truth_2side import edit_sim_banded, extract_two_sided_truth, seq_ident_kmer
 sys.path.insert(0, os.path.join(REPO, "benchmarks", "heldout", "scorer"))
 import claims_lr3 as c3
 
-RESFINDER_FA = "/private/tmp/claude-501/-Users-amulya-Documents-bigargs-anchorwalk-0-1/04d0a03e-7cdb-49b9-80f1-a80edf158510/scratchpad/resfinder_db/all.fsa"
-KMA = "/opt/miniconda3/bin/kma"
-KMA_INDEX = "/opt/miniconda3/bin/kma_index"
-FASTP = "/opt/homebrew/bin/fastp"
-MINIMAP2 = "/opt/miniconda3/envs/binner/bin/minimap2"
-SAMTOOLS = "/opt/miniconda3/envs/binner/bin/samtools"
-FASTQ_DUMP = "/opt/homebrew/bin/fastq-dump"
+RESFINDER_FA = os.environ.get("RESFINDER_FA", "resfinder_db/all.fsa")
+KMA = os.environ.get("KMA_BIN") or shutil.which("kma") or "kma"
+KMA_INDEX = os.environ.get("KMA_INDEX_BIN") or shutil.which("kma_index") or "kma_index"
+FASTP = os.environ.get("FASTP_BIN") or shutil.which("fastp") or "fastp"
+MINIMAP2 = os.environ.get("MINIMAP2_BIN") or shutil.which("minimap2") or "minimap2"
+SAMTOOLS = os.environ.get("SAMTOOLS_BIN") or shutil.which("samtools") or "samtools"
+FASTQ_DUMP = os.environ.get("FASTQ_DUMP_BIN") or shutil.which("fastq-dump") or "fastq-dump"
 GET_RUN = os.path.join(REPO, "benchmarks", "real_metagenome", "get_run.sh")
 ARGJACENT = os.path.join(REPO, "bin", "argjacent")
 ARGJACENT_COHORT = os.path.join(REPO, "bin", "argjacent-cohort")

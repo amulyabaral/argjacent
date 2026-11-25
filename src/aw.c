@@ -49,7 +49,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#define AW_VERSION "0.4.1"
+#define AW_VERSION "0.5.1"
 #define NONE 0xFFFFFFFFu
 #define ENONE 0x7FFFFFFFu                          /* end of a list of links (31 bits; the top bit of `next` is a side) */
 #define SLACK 800

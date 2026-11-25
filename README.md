@@ -66,7 +66,7 @@ A Conda build recipe is also provided in `recipe/`.
 argjacent -g genes.fa -1 sample_R1.fastq.gz -2 sample_R2.fastq.gz -o results/sample
 ```
 
-Inputs: paired 4-line FASTQ (plain or `.gz`, adapter-trimmed) and a FASTA of target genes (for example, alleles detected by KMA/ResFinder or a reference gene database). Key options: `-D` flank length per side (default `10000`), `-t` threads, `--max-mem` memory limit in GB, `-w` minimizer window (default `20`), `--max-paths` candidate branches per side (default `16`), `--pair-bp` pairing radius (default `500`), `--save-map` / `--map` to reuse the Pass-1 anchor graph across gene sets. Run `argjacent -h` for all options.
+Inputs: paired 4-line FASTQ (plain or `.gz`, adapter-trimmed) and a FASTA of target genes. Passing a full database (e.g., ResFinder or CARD) works directly; on deep metagenomes, pre-screening detected alleles first (for example with KMA) keeps local extension faster and leaner. Key options: `-D` flank length per side (default `10000`), `-t` threads, `--max-mem` memory limit in GB, `-w` minimizer window (default `20`), `--max-paths` candidate branches per side (default `16`), `--pair-bp` pairing radius (default `500`), `--save-map` / `--map` to reuse the Pass-1 anchor graph across gene sets. Run `argjacent -h` for all options.
 
 ### Multi-sample cohort deconvolution
 
@@ -75,10 +75,11 @@ argjacent-cohort \
   -g genes.fa \
   -i results/s1.flanks.json results/s2.flanks.json results/s3.flanks.json \
   -o results/cohort \
-  --gfa-dir results/cohort_gfa
+  --gfa-dir results/cohort_gfa \
+  -t 8
 ```
 
-For cohorts with sample-specific gene FASTA files, pass `--sample-sheet samples.tsv` (columns: `sample`, `flanks_json`, optional `genes_fa`, `reads_tsv`).
+You can also invoke this as `argjacent cohort ...`. For cohorts with sample-specific gene FASTA files, pass `--sample-sheet samples.tsv` (columns: `sample`, `flanks_json`, optional `genes_fa`, `reads_tsv`). Gene FASTA headers must match the keys inside `flanks.json`; `--family-mode` (default `auto`) collapses ResFinder allele copies (`<allele>_<copy>_<acc>`) without colliding RefSeq, CARD, or custom gene names (`exact` disables grouping).
 
 ### Large runs on a Slurm HPC
 
@@ -96,6 +97,14 @@ Ready-to-run Slurm array and dependent cohort scripts live in [`hpc/`](hpc/READM
 | `PREFIX.pairs.tsv` | Certified single-sample two-sided `[left + gene + right]` pairings with evidence tier and score. |
 | `PREFIX.gfa` | Lossless compacted gene-centered GFA v1.0 graph with `TP:Z:`, `DP:f:`, and Bandage `CL:Z:` colors. |
 | `PREFIX.flanks.json` | Full machine-readable record including `joins`, `depth_bins`, `gene_depth`, and `pairs` (input to `argjacent-cohort`). |
+
+Example `PREFIX.summary.tsv` rows (full 10 kb flank certifies to `9970` bp after the 30 bp safety margin; a repeat 3 kb downstream stops `certain_bp` at the repeat while retaining all 4 candidate branches in `PREFIX.flanks.fa` and `PREFIX.gfa`, which opens directly in Bandage with certainty colors applied):
+
+```text
+gene                side   status    contexts  certain_bp  longest_bp  contexts_certain_1kb  read_depth  gene_end  certain_end_bp
+blaCTX-M-15_1_...   left   complete  1         9970        10000       1                     42          sample    9970
+blaCTX-M-15_1_...   right  partial   4         4268        10000       4                     41          sample    4268
+```
 
 ---
 

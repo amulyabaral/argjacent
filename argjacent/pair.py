@@ -377,7 +377,7 @@ def index_sample_reads(genes_dict, doc_genes, reads_source, W=500):
             lt2, rt2, g2 = scan_read_for_gene(s2, info)
             lt = lt1 | lt2
             rt = rt1 | rt2
-            if len(lt) == 1 and len(rt) == 1:
+            if len(info["seq"]) <= 650 and len(lt) == 1 and len(rt) == 1:
                 info["span_counts"][(next(iter(lt)), next(iter(rt)))] += 1
             if (lt or rt or g1 or g2) and (g1 or g2):
                 merged_g = dict(g1)
@@ -397,11 +397,12 @@ def index_sample_reads(genes_dict, doc_genes, reads_source, W=500):
         gene_pairs = info["gene_pairs"]
         gseq = info["seq"]
 
-        for (li, ri), cnt in sorted(span_counts.items()):
-            other_l = sum(v for (l2, r2), v in span_counts.items() if l2 == li and r2 != ri)
-            other_r = sum(v for (l2, r2), v in span_counts.items() if r2 == ri and l2 != li)
-            if cnt >= 3 and cnt >= 8 * max(other_l, other_r):
-                phased_tiers[(li, ri)] = ("span_pair", "pairs=%d" % cnt)
+        if len(gseq) <= 650:
+            for (li, ri), cnt in sorted(span_counts.items()):
+                other_l = sum(v for (l2, r2), v in span_counts.items() if l2 == li and r2 != ri)
+                other_r = sum(v for (l2, r2), v in span_counts.items() if r2 == ri and l2 != li)
+                if cnt >= 3 and cnt >= 8 * max(other_l, other_r):
+                    phased_tiers[(li, ri)] = ("span_pair", "pairs=%d" % cnt)
 
         if len(l_trunks) >= 2 and len(r_trunks) >= 2 and len(gene_pairs) >= 10:
             pos_bases = collections.defaultdict(collections.Counter)

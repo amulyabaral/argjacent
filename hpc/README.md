@@ -147,7 +147,7 @@ OUT_DIR/
 │       └── <sample>.done             # completion marker
 ├── cohort/
 │   ├── cohort.cohort_pairs.tsv       # single-sample + cohort-resolved two-sided pairs (Part A)
-│   ├── cohort.cohort_repeats.tsv     # post-repeat exits (Part B — exploratory in chained repeats)
+│   ├── cohort.cohort_repeats.tsv     # post-repeat exits (Part B: exploratory in chained repeats)
 │   └── cohort.cohort.json            # full cohort JSON output
 ├── summary/
 │   ├── run_metrics.tsv               # per-sample QC, read pairs, runtime, peak RAM, flank counts

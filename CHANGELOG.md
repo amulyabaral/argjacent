@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.1 (2026-11-25)
+
+Cohort scaling optimizations (PR #1) and targeted bug fixes from the 25-sample expanded validation and second-round code audit.
+
+Fixed
+- **Enforced short-gene ceiling on `span_pair` (`argjacent/pair.py`):** strictly gates both accumulation and emission of direct read-pair bridging (`span_pair`) to `len(gene) <= 650 bp`. Previously, multi-trunk genes `> 650 bp` entering `index_sample_reads` for `snv_phase` could still emit `span_pair` across a co-existing cassette-deletion variant (the sole 2-sided chimera observed on CAMI II Strain Madness `s30 aadA2`).
+- **Preserved read-backed single-sample pairs in `argjacent-cohort` (`argjacent/cohort.py`):** `cohort_pair_family` now restores single-sample `span_pair` and `snv_phase` pairs stored in `flanks.json["genes"][g]["pairs"]` whenever `parameters.pair_bp >= W`, keeping them in `cohort_pairs.tsv`, `cohort.json`, and `--gfa-dir` outputs and allowing them to act as `cohort_anchor` seeds across samples.
+- **Safe cross-database gene-family grouping (`argjacent/cohort.py`):** replaced unconditional `g.split("_")[0]` grouping with `--family-mode {auto,exact,resfinder}` (default `auto`), which collapses ResFinder allele copies (`<allele>_<copy>_<accession>`) while keeping RefSeq (`NC_...`, `NZ_...`, `WP_...`), CARD, Prokka, and custom FASTA names distinct.
+- **Outlier-resistant Part B repeat fork selection (`argjacent/cohort.py`):** replaced `min(fork_votes)` with per-sample `±50 bp` modal cluster selection so a single outlier sample in a large cohort cannot drag `fork_bp` inside a shared repeat for all other samples.
+- **Collision-free GFA segment IDs and accurate read-length `RC:i:` (`argjacent/gfa.py`, `argjacent/cli.py`):** disambiguates distinct gene names that sanitize to the same GFA ID (such as `bla-1` and `bla_1`) and scales `RC:i:` by actual sample `read_len` instead of hardcoded `150`.
+- **Aligned C binary version strings (`src/{aw,awx,awv}.c`)** to `0.5.1` and removed hardcoded local machine paths in `benchmarks/v05_validation/run_*.py`.
+
+Improved
+- **Exact multi-sample cohort scaling (`argjacent/cohort.py`, `argjacent/pair.py`):** `co_present` gating before NNLS, sorted leave-one-sample-out early-break, sparse column/row pruning with Gram-Cholesky + SVD fallback in `_nnls_weighted`, NumPy `uint8` vectorized `seq_sim_fast` / `divergence_bp` / `_ExactSeqClusters`, cached FASTA loading in `_load_cohort_inputs`, slimmed per-sample GFA worker payloads, and `-t/--threads` `spawn` multiprocessing (`5.5-21x` faster with exact equivalence; `--cohort-cpus` added to `hpc/submit_pipeline.sh`).
+- **CI:** added GitHub Actions workflow (`.github/workflows/ci.yml`) testing Linux (GCC) and macOS (Clang) across Python 3.10 and 3.12 (`pip install .`, `argjacent-selftest`, `pytest`, and `hpc/test_hpc_local.sh`).
+
 ## 0.5.0 (2026-11-22) — Renamed to ARGjacent
 
 Renamed package and CLI from `bigargs-anchorwalk` (`aw-flank`, `aw-cohort`, `aw-flank-selftest`) to **`argjacent`**

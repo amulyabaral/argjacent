@@ -19,12 +19,12 @@ import tarfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-RESFINDER_FA = "/private/tmp/claude-501/-Users-amulya-Documents-bigargs-anchorwalk-0-1/04d0a03e-7cdb-49b9-80f1-a80edf158510/scratchpad/resfinder_db/all.fsa"
-KMA = "/opt/miniconda3/bin/kma"
-KMA_INDEX = "/opt/miniconda3/bin/kma_index"
-MINIMAP2 = "/opt/miniconda3/pkgs/minimap2-2.31-h6bd33b9_0/bin/minimap2"
-BLASTN = "/opt/miniconda3/pkgs/blast-2.17.0-h81fc81c_1/bin/blastn"
-MAKEBLASTDB = "/opt/miniconda3/pkgs/blast-2.17.0-h81fc81c_1/bin/makeblastdb"
+RESFINDER_FA = os.environ.get("RESFINDER_FA", "resfinder_db/all.fsa")
+KMA = os.environ.get("KMA_BIN") or shutil.which("kma") or "kma"
+KMA_INDEX = os.environ.get("KMA_INDEX_BIN") or shutil.which("kma_index") or "kma_index"
+MINIMAP2 = os.environ.get("MINIMAP2_BIN") or shutil.which("minimap2") or "minimap2"
+BLASTN = os.environ.get("BLASTN_BIN") or shutil.which("blastn") or "blastn"
+MAKEBLASTDB = os.environ.get("MAKEBLASTDB_BIN") or shutil.which("makeblastdb") or "makeblastdb"
 ARGJACENT = os.path.join(REPO, "bin", "argjacent")
 KMA_GENES = os.path.join(REPO, "benchmarks", "cami", "kma_genes.py")
 SCORE_SAMPLE = os.path.join(REPO, "benchmarks", "v05_validation", "score_v05_cami.py")

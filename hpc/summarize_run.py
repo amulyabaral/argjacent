@@ -241,7 +241,7 @@ def main():
     print(f"  Two-sided pairs    : {tot_pairs:,} single-sample" +
           (f"; {cp_tot:,} cohort total (+{cp_added:,} resolved by cohort Part A)" if os.path.isfile(cp_path) else ""))
     if os.path.isfile(cr_path):
-        print(f"  Post-repeat exits  : {cr_tot:,} (Part B — exploratory in chained repeats)")
+        print(f"  Post-repeat exits  : {cr_tot:,} (Part B: exploratory in chained repeats)")
     print(f"  Summary tables     : {summary_dir}/")
 
 

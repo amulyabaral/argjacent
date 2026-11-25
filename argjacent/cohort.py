@@ -20,6 +20,7 @@ import gzip
 import json
 import multiprocessing
 import os
+import re
 import statistics
 import sys
 import time
@@ -209,20 +210,82 @@ class _ExactSeqClusters:
 # Part A: Cohort-wide Left-Right Flank Pairing
 # ==============================================================================
 
-def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_min=8.0, include_prox=False):
+_RESFINDER_FAM_RX = re.compile(
+    r"^(?![A-Z]{2}_\d{5,})(.+?)_[1-9]\d{0,2}_(?:[A-Za-z]{2}_[A-Za-z]{0,6}|[A-Za-z]{1,6})\d{4,}[A-Za-z0-9._-]*$"
+)
+
+
+def gene_family(name, mode="auto"):
+    """Map a gene header to its cohort pairing family.
+
+    - `auto` (default): collapses ResFinder allele copies (`<allele>_<copy>_<accession>`, e.g.
+      `blaTEM-1B_1_JF910132` -> `blaTEM-1B`), while keeping RefSeq (`NC_000913_...`), CARD,
+      Prokka, and arbitrary custom gene names distinct.
+    - `exact`: never merges distinct gene names.
+    - `resfinder`: legacy prefix split on the first underscore (`name.split('_')[0]`).
+    """
+    if mode == "exact":
+        return name
+    if mode == "resfinder":
+        return name.split("_")[0]
+    m = _RESFINDER_FAM_RX.match(name)
+    return m.group(1) if m else name
+
+
+def _stored_phased_for_gene(sd, gene_name, W, l_all, r_all):
+    """Recover read-backed single-sample pairs (`span_pair`, `snv_phase`) stored in `flanks.json`
+    when `sd['pre_phased']` was not explicitly supplied by the caller.
+
+    Only reuses stored pairs when the sample was paired at radius `>= W` (or when `parameters`
+    is omitted in synthetic inputs), and strictly enforces `len(gene) <= 650` on `span_pair`.
+    """
+    if "pre_phased" in sd and sd["pre_phased"] is not None:
+        return sd["pre_phased"].get(gene_name)
+    doc = sd.get("doc", {})
+    g_ent = doc.get("genes", {}).get(gene_name, {})
+    saved_pairs = g_ent.get("pairs")
+    if not saved_pairs:
+        return None
+    saved_w = doc.get("parameters", {}).get("pair_bp")
+    if saved_w is not None and int(saved_w) < int(W):
+        return None
+    gseq = sd.get("genes", {}).get(gene_name, "")
+    l_by_cid = {cid: idx for idx, t in enumerate(l_all) for cid in t["cand_ids"]}
+    r_by_cid = {cid: idx for idx, t in enumerate(r_all) for cid in t["cand_ids"]}
+    phased = {}
+    for pr in saved_pairs:
+        tier = pr.get("tier")
+        if tier not in ("span_pair", "snv_phase"):
+            continue
+        if tier == "span_pair" and len(gseq) > 650:
+            continue
+        li = l_by_cid.get(pr.get("left_id"))
+        ri = r_by_cid.get(pr.get("right_id"))
+        if li is not None and ri is not None and (li, ri) not in phased:
+            phased[(li, ri)] = (tier, pr.get("note", ""))
+    return phased or None
+
+
+def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_min=8.0,
+                       include_prox=False, family_mode="auto"):
     """Run cohort-wide left-right pairing for one gene family across S samples."""
     per_sg_single = collections.defaultdict(dict)
     sample_reps = []
     for sd in samples_data:
         sid = sd["sid"]
         doc_genes = sd["doc"].get("genes", {})
-        fam_genes = sorted(g for g in doc_genes if g.split("_")[0] == fam and g in sd["genes"])
+        fam_genes = sorted(g for g in doc_genes if gene_family(g, family_mode) == fam and g in sd["genes"])
         if not fam_genes:
             continue
+        trunks_by_g = {}
         for g in fam_genes:
+            l_g = extract_trunks(doc_genes[g].get("left", {}).get("paths", []), "left", W=W)
+            r_g = extract_trunks(doc_genes[g].get("right", {}).get("paths", []), "right", W=W)
+            trunks_by_g[g] = (l_g, r_g)
+            pre_ph = _stored_phased_for_gene(sd, g, W, l_g, r_g)
             sp = pair_gene_single_sample(
                 g, sd["genes"][g], doc_genes[g], W=W,
-                pre_phased=sd.get("pre_phased", {}).get(g),
+                pre_phased=pre_ph,
                 include_prox=include_prox,
             )
             per_sg_single[sid][g] = list(sp)
@@ -234,9 +297,7 @@ def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_m
                 g,
             ),
         )
-        g_ent = doc_genes[best_g]
-        l_all = extract_trunks(g_ent.get("left", {}).get("paths", []), "left", W=W)
-        r_all = extract_trunks(g_ent.get("right", {}).get("paths", []), "right", W=W)
+        l_all, r_all = trunks_by_g[best_g]
         if l_all and r_all:
             sample_reps.append((sid, best_g, fam_genes, l_all, r_all, per_sg_single[sid][best_g]))
 
@@ -495,13 +556,15 @@ def cohort_pair_family(samples_data, fam, W=500, delta_chi2_min=12.0, loo_chi2_m
 
 
 def _pair_family_worker(task):
-    fam_samples, fam, W, include_prox = task
-    return fam, dict(cohort_pair_family(fam_samples, fam, W=W, include_prox=include_prox))
+    fam_samples, fam, W, include_prox, family_mode = task
+    return fam, dict(cohort_pair_family(
+        fam_samples, fam, W=W, include_prox=include_prox, family_mode=family_mode
+    ))
 
 
-def cohort_pair_all(samples_data, W=500, include_prox=False, threads=1):
+def cohort_pair_all(samples_data, W=500, include_prox=False, threads=1, family_mode="auto"):
     """Run cohort pairing across all gene families in `samples_data`."""
-    fams = sorted({g.split("_")[0] for sd in samples_data for g in sd["doc"].get("genes", {})})
+    fams = sorted({gene_family(g, family_mode) for sd in samples_data for g in sd["doc"].get("genes", {})})
     out = {sd["sid"]: {} for sd in samples_data}
     if threads > 1 and len(fams) > 1:
         tasks = []
@@ -509,18 +572,18 @@ def cohort_pair_all(samples_data, W=500, include_prox=False, threads=1):
             fam_samples = []
             for sd in samples_data:
                 doc_genes = sd["doc"].get("genes", {})
-                fgenes = {g: doc_genes[g] for g in doc_genes if g.split("_")[0] == fam and g in sd["genes"]}
+                fgenes = {g: doc_genes[g] for g in doc_genes if gene_family(g, family_mode) == fam and g in sd["genes"]}
                 if not fgenes:
                     continue
                 entry = {
                     "sid": sd["sid"],
                     "genes": {g: sd["genes"][g] for g in fgenes},
-                    "doc": {"genes": fgenes},
+                    "doc": {"parameters": sd["doc"].get("parameters", {}), "genes": fgenes},
                 }
                 if "pre_phased" in sd:
                     entry["pre_phased"] = {g: sd["pre_phased"][g] for g in fgenes if g in sd["pre_phased"]}
                 fam_samples.append(entry)
-            tasks.append((fam_samples, fam, W, include_prox))
+            tasks.append((fam_samples, fam, W, include_prox, family_mode))
         mp_ctx = multiprocessing.get_context("spawn")
         with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(tasks)), mp_context=mp_ctx) as ex:
             results = list(ex.map(_pair_family_worker, tasks))
@@ -531,7 +594,7 @@ def cohort_pair_all(samples_data, W=500, include_prox=False, threads=1):
                         out[sid][g] = plist
     else:
         for fam in fams:
-            res = cohort_pair_family(samples_data, fam, W=W, include_prox=include_prox)
+            res = cohort_pair_family(samples_data, fam, W=W, include_prox=include_prox, family_mode=family_mode)
             for sid, gmap in res.items():
                 for g, plist in gmap.items():
                     if plist:
@@ -664,6 +727,30 @@ def _measure_repeat_from_reads(gene_seq, synth_paths, side, reads_tsv_path, fork
     return round(g_depth, 2), cstats
 
 
+def _select_modal_fork_bp(sample_fork_sets, tol_bp=50):
+    """Select the dominant repeat fork distance across samples without letting a single
+    outlier sample drag `fork_bp` down across a large cohort.
+
+    Each sample casts at most one vote per `tol_bp`-wide cluster; ties break toward the
+    earliest fork distance, returning the cluster's integer median.
+    """
+    all_pts = sorted({dv for s in sample_fork_sets for dv in s})
+    if not all_pts:
+        return None
+    best = None
+    for center in all_pts:
+        members = []
+        for s in sample_fork_sets:
+            close = [dv for dv in s if abs(dv - center) <= tol_bp]
+            if close:
+                members.append(min(close))
+        med = int(round(statistics.median(members)))
+        key = (-len(members), med)
+        if best is None or key < best:
+            best = key
+    return best[1]
+
+
 def cohort_deconvolve_repeats(samples_data, gene_name, side, min_repeat_bp=400, target_bp=5000,
                               delta_chi2_min=12.0, loo_chi2_min=6.0):
     """Resolve post-repeat exit arms (`[Gene] -> [Shared Repeat >= min_repeat_bp] -> [Exits]`)
@@ -674,7 +761,7 @@ def cohort_deconvolve_repeats(samples_data, gene_name, side, min_repeat_bp=400, 
     """
     active_samples = []
     exit_clusters = []
-    fork_votes = []
+    sample_fork_sets = []
 
     for sd in samples_data:
         gseq = sd["genes"].get(gene_name)
@@ -690,16 +777,21 @@ def cohort_deconvolve_repeats(samples_data, gene_name, side, min_repeat_bp=400, 
         has_reads = bool(sd.get("reads_tsv") and os.path.exists(sd["reads_tsv"]))
         if not (has_bins or has_reads):
             continue
+        s_forks = set()
         for i in range(len(outs)):
             for j in range(i + 1, len(outs)):
                 dv = divergence_bp(outs[i][1], outs[j][1])
                 if min_repeat_bp <= dv < min(len(outs[i][1]), len(outs[j][1])) - 50:
-                    fork_votes.append(dv)
+                    s_forks.add(dv)
+        if s_forks:
+            sample_fork_sets.append(s_forks)
         active_samples.append((sd, gseq, paths, outs))
 
-    if len(active_samples) < 4 or not fork_votes:
+    if len(active_samples) < 4 or not sample_fork_sets:
         return {}
-    fork_bp = int(min(fork_votes))
+    fork_bp = _select_modal_fork_bp(sample_fork_sets, tol_bp=50)
+    if fork_bp is None:
+        return {}
     ex_cl = _ExactSeqClusters(max_len=400, thr=0.96)
 
     for sd, gseq, paths, outs in active_samples:
@@ -917,12 +1009,13 @@ def cohort_deconvolve_all_repeats(samples_data, min_repeat_bp=400, target_bp=500
 
 
 def _gfa_export_worker(task):
-    genes, doc_genes, out_path, pairs_by_gene, cohort_exts_by_gene = task
+    genes, doc_genes, out_path, pairs_by_gene, cohort_exts_by_gene, read_len = task
     write_gfa(
         genes, doc_genes, out_path,
         pairs_by_gene=pairs_by_gene,
         cohort_exts_by_gene=cohort_exts_by_gene,
         verify=True,
+        read_len=read_len,
     )
     return out_path
 
@@ -943,7 +1036,15 @@ def _guess_reads_tsv(flanks_json_path):
 
 def _load_cohort_inputs(args):
     samples = []
-    shared_genes = read_fa_dict(args.genes) if args.genes else None
+    fa_cache = {}
+
+    def _get_fa(path):
+        ap = os.path.abspath(path)
+        if ap not in fa_cache:
+            fa_cache[ap] = read_fa_dict(ap)
+        return fa_cache[ap]
+
+    shared_genes = _get_fa(args.genes) if args.genes else None
     if args.sample_sheet:
         with open(args.sample_sheet) as f:
             header = f.readline().rstrip("\r\n").split("\t")
@@ -959,11 +1060,13 @@ def _load_cohort_inputs(args):
                 jp = parts[col["flanks_json"]].strip()
                 gf = parts[col["genes_fa"]].strip() if "genes_fa" in col and len(parts) > col["genes_fa"] and parts[col["genes_fa"]].strip() else None
                 rt = parts[col["reads_tsv"]].strip() if "reads_tsv" in col and len(parts) > col["reads_tsv"] and parts[col["reads_tsv"]].strip() else _guess_reads_tsv(jp)
-                gdict = read_fa_dict(gf) if gf else shared_genes
+                gdict = _get_fa(gf) if gf else shared_genes
                 if not gdict:
                     sys.stderr.write("argjacent-cohort: supply -g genes.fa or a 'genes_fa' column in --sample-sheet\n")
                     sys.exit(1)
-                samples.append({"sid": sid, "genes": gdict, "doc": json.load(open(jp)), "reads_tsv": rt, "json_path": jp})
+                with open(jp) as jfh:
+                    doc = json.load(jfh)
+                samples.append({"sid": sid, "genes": gdict, "doc": doc, "reads_tsv": rt, "json_path": jp})
     else:
         if not args.inputs or not shared_genes:
             sys.stderr.write("argjacent-cohort: provide -g genes.fa and -i SAMPLE1.flanks.json SAMPLE2.flanks.json ... (or --sample-sheet)\n")
@@ -979,7 +1082,9 @@ def _load_cohort_inputs(args):
             if sid in seen_ids:
                 sid = "%s_%d" % (sid, idx)
             seen_ids.add(sid)
-            samples.append({"sid": sid, "genes": shared_genes, "doc": json.load(open(jp)),
+            with open(jp) as jfh:
+                doc = json.load(jfh)
+            samples.append({"sid": sid, "genes": shared_genes, "doc": doc,
                             "reads_tsv": _guess_reads_tsv(jp), "json_path": jp})
     return samples
 
@@ -998,6 +1103,8 @@ def main(argv=None):
                     help="tab-separated table with columns: sample, flanks_json [, genes_fa, reads_tsv]")
     ap.add_argument("-o", "--out", required=True, help="output prefix (writes PREFIX.cohort_pairs.tsv, PREFIX.cohort_repeats.tsv, PREFIX.cohort.json)")
     ap.add_argument("--pair-bp", type=int, default=500, help="certified flank radius W for two-sided pairing (default 500)")
+    ap.add_argument("--family-mode", choices=("auto", "exact", "resfinder"), default="auto",
+                    help="how gene headers are grouped into Part A families: 'auto' (default, collapses ResFinder <allele>_<copy>_<acc> only), 'exact' (no merging), or 'resfinder' (split on first '_')")
     ap.add_argument("--min-repeat-bp", type=int, default=400, help="minimum shared repeat length for post-repeat deconvolution (default 400)")
     ap.add_argument("--target-bp", type=int, default=5000, help="maximum outward distance for post-repeat cohort certification (default 5000)")
     ap.add_argument("--gfa-dir", metavar="DIR", help="optional directory to write updated per-sample GFA v1.0 graphs with cohort paths")
@@ -1019,7 +1126,7 @@ def main(argv=None):
         os.makedirs(out_dir, exist_ok=True)
 
     t_a = time.time()
-    pairs_by_sid = cohort_pair_all(samples, W=args.pair_bp, threads=threads)
+    pairs_by_sid = cohort_pair_all(samples, W=args.pair_bp, threads=threads, family_mode=args.family_mode)
     sys.stderr.write("argjacent-cohort: Part A (two-sided pairing) finished in %.1fs\n" % (time.time() - t_a))
     sys.stderr.flush()
 
@@ -1064,11 +1171,13 @@ def main(argv=None):
                             int(ex["n_samples"]), ex["source"],
                         ))
 
-    # Strip full flank strings from compact cohort JSON summary? Keep `flank` truncated only in TSV, full in JSON!
     with open(args.out + ".cohort.json", "w") as f:
         json.dump({
             "version": VERSION,
-            "parameters": {"pair_bp": args.pair_bp, "min_repeat_bp": args.min_repeat_bp, "target_bp": args.target_bp},
+            "parameters": {
+                "pair_bp": args.pair_bp, "family_mode": args.family_mode,
+                "min_repeat_bp": args.min_repeat_bp, "target_bp": args.target_bp,
+            },
             "samples": [sd["sid"] for sd in samples],
             "pairs": pairs_by_sid,
             "repeats": repeats_by_sid,
@@ -1078,25 +1187,33 @@ def main(argv=None):
         t_g = time.time()
         os.makedirs(args.gfa_dir, exist_ok=True)
         if threads > 1 and len(samples) > 1:
-            gfa_tasks = [
-                (sd["genes"], sd["doc"].get("genes", {}),
-                 os.path.join(args.gfa_dir, sd["sid"] + ".gfa"),
-                 pairs_by_sid.get(sd["sid"], {}),
-                 repeats_by_sid.get(sd["sid"], {}))
-                for sd in samples
-            ]
+            gfa_tasks = []
+            for sd in samples:
+                dg = sd["doc"].get("genes", {})
+                rlen = sd["doc"].get("parameters", {}).get("read_len") or 150.0
+                gfa_tasks.append((
+                    {g: sd["genes"][g] for g in dg if g in sd["genes"]},
+                    dg,
+                    os.path.join(args.gfa_dir, sd["sid"] + ".gfa"),
+                    pairs_by_sid.get(sd["sid"], {}),
+                    repeats_by_sid.get(sd["sid"], {}),
+                    rlen,
+                ))
             mp_ctx = multiprocessing.get_context("spawn")
             with concurrent.futures.ProcessPoolExecutor(max_workers=min(threads, len(gfa_tasks)), mp_context=mp_ctx) as ex:
                 list(ex.map(_gfa_export_worker, gfa_tasks))
         else:
             for sd in samples:
                 sid = sd["sid"]
+                dg = sd["doc"].get("genes", {})
+                rlen = sd["doc"].get("parameters", {}).get("read_len") or 150.0
                 write_gfa(
-                    sd["genes"], sd["doc"].get("genes", {}),
+                    sd["genes"], dg,
                     os.path.join(args.gfa_dir, sid + ".gfa"),
                     pairs_by_gene=pairs_by_sid.get(sid, {}),
                     cohort_exts_by_gene=repeats_by_sid.get(sid, {}),
                     verify=True,
+                    read_len=rlen,
                 )
         sys.stderr.write("argjacent-cohort: wrote %d GFA files in %.1fs\n" % (len(samples), time.time() - t_g))
         sys.stderr.flush()

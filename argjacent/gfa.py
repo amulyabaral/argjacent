@@ -193,12 +193,14 @@ def _build_outward_segments(paths, side, gid_prefix):
     return raw_segs, links, cand_seg_lists, root_seg_ids
 
 
-def build_gene_gfa(gene_name, gene_seq, gene_entry, pairs=None, cohort_exts=None):
+def build_gene_gfa(gene_name, gene_seq, gene_entry, pairs=None, cohort_exts=None,
+                   gid_override=None, read_len=150.0):
     """Build GFA v1.0 lines (`S`, `L`, `P`) for one gene.
 
     Returns `(lines, seg_seq, l_cpaths, r_cpaths)`.
     """
-    gid = _sanitize_id(gene_name)
+    gid = gid_override if gid_override is not None else _sanitize_id(gene_name)
+    rlen = max(1.0, float(read_len) if read_len else 150.0)
     left_paths = gene_entry.get("left", {}).get("paths", [])
     right_paths = gene_entry.get("right", {}).get("paths", [])
     g_deps = [float(p.get("gene_depth", 0.0)) for p in left_paths + right_paths if p.get("gene_depth", 0.0) > 0]
@@ -219,15 +221,15 @@ def build_gene_gfa(gene_name, gene_seq, gene_entry, pairs=None, cohort_exts=None
 
     for s in l_segs:
         seg_seq[s["id"]] = s["seq"]
-        rc = int(round(s["dp"] * s["ln"] / 150.0))
+        rc = int(round(s["dp"] * s["ln"] / rlen))
         lines.append("S\t%s\t%s\tLN:i:%d\tDP:f:%.1f\tRC:i:%d\tTP:Z:%s\tSD:Z:left\tCL:Z:%s" % (
             s["id"], s["seq"], s["ln"], s["dp"], rc, s["tp"], s["cl"]))
-    rc_g = int(round(g_dp * len(gene_seq) / 150.0))
+    rc_g = int(round(g_dp * len(gene_seq) / rlen))
     lines.append("S\t%s\t%s\tLN:i:%d\tDP:f:%.1f\tRC:i:%d\tTP:Z:gene\tSD:Z:gene\tCL:Z:#d95f02" % (
         g_seg_id, gene_seq, len(gene_seq), g_dp, rc_g))
     for s in r_segs:
         seg_seq[s["id"]] = s["seq"]
-        rc = int(round(s["dp"] * s["ln"] / 150.0))
+        rc = int(round(s["dp"] * s["ln"] / rlen))
         lines.append("S\t%s\t%s\tLN:i:%d\tDP:f:%.1f\tRC:i:%d\tTP:Z:%s\tSD:Z:right\tCL:Z:%s" % (
             s["id"], s["seq"], s["ln"], s["dp"], rc, s["tp"], s["cl"]))
 
@@ -281,21 +283,33 @@ def verify_roundtrip(gene_entry, seg_seq, l_cpaths, r_cpaths):
             raise AssertionError("Right GFA roundtrip mismatch on %s (%d vs %d bp)" % (p["id"], len(recon), len(p["flank"])))
 
 
-def write_gfa(genes_dict, doc_genes, out_gfa, pairs_by_gene=None, cohort_exts_by_gene=None, verify=True):
+def write_gfa(genes_dict, doc_genes, out_gfa, pairs_by_gene=None, cohort_exts_by_gene=None,
+              verify=True, read_len=150.0):
     """Write a combined GFA v1.0 file from in-memory gene sequences and `flanks.json['genes']`."""
     out_lines = ["H\tVN:Z:1.0"]
     n_genes = n_segs = n_links = n_paths = 0
     raw_bp = comp_bp = 0
+    used_gids = set()
     for gname, gentry in doc_genes.items():
         gseq = genes_dict.get(gname)
         if not gseq:
             continue
+        base_gid = _sanitize_id(gname)
+        gid = base_gid
+        suffix = 2
+        while gid in used_gids:
+            gid = "%s__%d" % (base_gid, suffix)
+            suffix += 1
+        used_gids.add(gid)
         n_genes += 1
         prs = (pairs_by_gene or {}).get(gname)
         if prs is None:
             prs = gentry.get("pairs")
         cext = (cohort_exts_by_gene or {}).get(gname)
-        lines, seg_seq, lc, rc = build_gene_gfa(gname, gseq, gentry, pairs=prs, cohort_exts=cext)
+        lines, seg_seq, lc, rc = build_gene_gfa(
+            gname, gseq, gentry, pairs=prs, cohort_exts=cext,
+            gid_override=gid, read_len=read_len,
+        )
         if verify:
             verify_roundtrip(gentry, seg_seq, lc, rc)
         for ln in lines:
@@ -323,8 +337,9 @@ def write_gfa(genes_dict, doc_genes, out_gfa, pairs_by_gene=None, cohort_exts_by
 def export_sample_gfa(genes_fa, flanks_json, out_gfa, pairs_by_gene=None, cohort_exts_by_gene=None, verify=True):
     genes = dict(read_fasta(genes_fa))
     doc = json.load(open(flanks_json))
+    rlen = doc.get("parameters", {}).get("read_len") or 150.0
     return write_gfa(genes, doc.get("genes", {}), out_gfa, pairs_by_gene=pairs_by_gene,
-                     cohort_exts_by_gene=cohort_exts_by_gene, verify=verify)
+                     cohort_exts_by_gene=cohort_exts_by_gene, verify=verify, read_len=rlen)
 
 
 def main(argv=None):
