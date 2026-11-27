@@ -275,7 +275,7 @@ def fetch_ena_analyses_by_erz(erz_list, chunk_size=250):
     return out
 
 
-def fetch_read_runs(run_accs, chunk_size=300, workers=4):
+def fetch_read_runs(run_accs, chunk_size=200, workers=4):
     """Batch-fetch ENA read_run metadata for a list of run accessions."""
     fields = ",".join([
         "run_accession", "study_accession", "sample_accession",
@@ -289,18 +289,28 @@ def fetch_read_runs(run_accs, chunk_size=300, workers=4):
     ])
     chunks = [run_accs[i:i + chunk_size] for i in range(0, len(run_accs), chunk_size)]
     sys.stderr.write(f"[2/4] Batch-fetching ENA read_run metadata for {len(run_accs):,} single-run accessions ({len(chunks)} chunks)...\n")
+    sys.stderr.flush()
     by_run = {}
 
     def _one(ch):
         q = " OR ".join(f'run_accession="{r}"' for r in ch)
-        return ena_post_tsv({"result": "read_run", "query": q, "fields": fields, "limit": "0", "format": "tsv"})
+        try:
+            return ena_post_tsv({"result": "read_run", "query": q, "fields": fields, "limit": "0", "format": "tsv"}, timeout=45)
+        except Exception as e:
+            sys.stderr.write(f"      WARN: read_run chunk failed ({e}); skipping {len(ch)} runs.\n")
+            return []
 
+    done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         for res in ex.map(_one, chunks):
+            done += 1
             for r in res:
                 ra = r.get("run_accession", "").strip()
                 if ra:
                     by_run[ra] = r
+            if done % 15 == 0 or done == len(chunks):
+                sys.stderr.write(f"      read_run chunks: {done}/{len(chunks)} ({len(by_run):,} matched)\n")
+                sys.stderr.flush()
     sys.stderr.write(f"      Matched {len(by_run):,} / {len(run_accs):,} runs in ENA read_run.\n")
     return by_run
 
@@ -471,7 +481,39 @@ def main():
     if not single_by_run:
         sys.exit("No 1-to-1 single-run assemblies matched the query.")
 
-    run_meta = fetch_read_runs(sorted(single_by_run), workers=min(args.workers, 6))
+    # Pre-filter obvious analysis-level criteria BEFORE batch-querying read_run (cuts ENA API calls 3-5x!)
+    if args.require_country:
+        # Keep rows whose analysis record already has a country OR blank (read_run may still fill country,
+        # unless > 60% already have country in analysis table; drop explicit 'missing'/'not collected')
+        n_with_c = sum(1 for r in single_by_run.values() if clean_country(r.get("country")))
+        if n_with_c >= 0.5 * len(single_by_run):
+            single_by_run = {ra: r for ra, r in single_by_run.items() if clean_country(r.get("country"))}
+    if args.min_study_samples > 1:
+        st_cnt = collections.Counter(r.get("study_accession", "").strip() for r in single_by_run.values())
+        single_by_run = {
+            ra: r for ra, r in single_by_run.items()
+            if st_cnt[r.get("study_accession", "").strip()] >= args.min_study_samples
+        }
+
+    # If stratifying with --per-biome and --max-per-study, cap oversized studies at 6x headroom
+    # before fetching read_run so giant 2,000-sample gut studies don't burn 50 unnecessary API chunks
+    if args.per_biome > 0 and len(single_by_run) > 2500:
+        rng_pre = random.Random(args.seed)
+        cap_study = max(args.max_per_study * 6, 40) if args.max_per_study > 0 else max(args.per_biome * 2, 120)
+        by_st_pre = collections.defaultdict(list)
+        for ra, r in sorted(single_by_run.items()):
+            by_st_pre[r.get("study_accession", "").strip()].append((ra, r))
+        trimmed = {}
+        for st, items in sorted(by_st_pre.items()):
+            if len(items) > cap_study:
+                rng_pre.shuffle(items)
+                items = items[:cap_study]
+            for ra, r in items:
+                trimmed[ra] = r
+        sys.stderr.write(f"      Pre-trimmed oversized studies before read_run lookup: {len(single_by_run):,} -> {len(trimmed):,} runs.\n")
+        single_by_run = trimmed
+
+    run_meta = fetch_read_runs(sorted(single_by_run), chunk_size=120, workers=min(args.workers, 3))
 
     allowed_platforms = {p.strip().upper() for p in args.platforms.split(",") if p.strip()}
     allowed_biomes = {b.strip().lower() for b in args.biomes.split(",") if b.strip()} if args.biomes else None

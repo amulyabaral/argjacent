@@ -129,9 +129,16 @@ fetch_file() {
         return 0
     fi
     if command -v curl >/dev/null 2>&1; then
-        curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 --max-time 3600 -sS -o "$dst" "$src"
+        if ! curl -fL -C - --retry 2 --retry-delay 5 --connect-timeout 15 --max-time 3600 -sS -o "$dst" "$src"; then
+            if [[ "$src" == https://ftp.sra.ebi.ac.uk/* ]]; then
+                local alt="http://${src#https://}"
+                curl -fL -C - --retry 5 --retry-delay 8 --retry-all-errors --connect-timeout 30 --max-time 3600 -sS -o "$dst" "$alt"
+            else
+                return 1
+            fi
+        fi
     elif command -v wget >/dev/null 2>&1; then
-        wget -q --tries=5 --waitretry=5 --timeout=30 -O "$dst" "$src"
+        wget -q -c --tries=5 --waitretry=5 --timeout=30 -O "$dst" "$src"
     else
         echo "ERROR: neither curl nor wget found to fetch ${src}" >&2
         return 1

@@ -58,6 +58,15 @@ STOP_CODONS = {"TAA", "TAG", "TGA"}
 
 PLASMID_MOG_HINTS = re.compile(r"\b(transfer|conjug|mob[a-z0-9]|tra[a-z]|trb[a-z]|rep[a-z0-9]|par[ab]|plasmid|oriT)\b", re.I)
 IS_MOG_HINTS = re.compile(r"\b(integration/excision|transpos|integras|recombinas|resolv|ins[a-z]|tnp[a-z]|intI)\b", re.I)
+SYNTH_VECTOR_RE = re.compile(
+    r"(cloning vector|expression vector|shuttle vector|artificial cloning|synthetic construct|"
+    r"\b(?:pUC\d*|pET\w*|pBR32\d|pMB1|ColE1|pGEM\w*|pBluescript\w*|pBAD\w*|pGEX\w*|pMAL\w*|pACYC\w*|pCDNA\w*|pQE\w*|pTrc\w*|pBGS\w*)\b)",
+    re.I,
+)
+NATURAL_UNIVEC_EXCLUDE_RE = re.compile(
+    r"(RSF1010|pC221|pBBR1|pT181|pUB110|pE194|pC194|pWV01|lactose operon|Coliphage|phage lambda|Phage M13|Simian virus|Transposon Tn)",
+    re.I,
+)
 
 
 def rc(seq):
@@ -279,6 +288,13 @@ def run_nuc_search(query_fa, db_path, min_id, min_alen, min_scov, threads, tmp_d
                 })
 
     elif backend == "minimap2":
+        sdescs = {}
+        if os.path.isfile(db_path):
+            with open(db_path) as dfh:
+                for line in dfh:
+                    if line.startswith(">"):
+                        parts = line[1:].strip().split(None, 1)
+                        sdescs[parts[0]] = parts[1] if len(parts) > 1 else ""
         paf = os.path.join(tmp_dir, f"mm2_{tag}.paf")
         with open(paf, "w") as out_fh:
             subprocess.run(
@@ -300,7 +316,7 @@ def run_nuc_search(query_fa, db_path, min_id, min_alen, min_scov, threads, tmp_d
                 if pid < min_id or (qe0 - qs0) < min_alen or scov < min_scov:
                     continue
                 hits[q].append({
-                    "subject": s, "sdesc": "", "pident": pid, "alen": qe0 - qs0, "scov": min(100.0, scov),
+                    "subject": s, "sdesc": sdescs.get(s, ""), "pident": pid, "alen": qe0 - qs0, "scov": min(100.0, scov),
                     "qstart0": qs0, "qend0": qe0,
                 })
 
@@ -824,11 +840,22 @@ def annotate_arm(arm_name, fasta_path, manifest_meta, args, out_dir):
         vec_hits = {}
         if args.univec_db:
             sys.stderr.write("  [1/5] Screening cloning/reagent vectors (--univec-db)...\n")
-            vec_hits = run_nuc_search(
-                filt_fa, args.univec_db, min_id=90.0, min_alen=150, min_scov=0.0,
+            raw_vec = run_nuc_search(
+                filt_fa, args.univec_db, min_id=90.0, min_alen=350, min_scov=0.0,
                 threads=args.threads, tmp_dir=tmp_dir, tag="univec",
                 allow_fallback=args.allow_python_fallback, aligner=args.nuc_aligner,
             )
+            # Keep synthetic cloning/expression vectors and exclude natural plasmids/phages in NCBI UniVec
+            for fid, hs in raw_vec.items():
+                kept_v = []
+                for h in hs:
+                    txt = f"{h['subject']} {h.get('sdesc', '')}"
+                    if NATURAL_UNIVEC_EXCLUDE_RE.search(txt):
+                        continue
+                    if not h.get("sdesc") or SYNTH_VECTOR_RE.search(txt):
+                        kept_v.append(h)
+                if kept_v:
+                    vec_hits[fid] = kept_v
 
         # Layer 2a: Co-localized ARGs (nucleotide)
         coarg_hits = {}
@@ -849,6 +876,26 @@ def annotate_arm(arm_name, fasta_path, manifest_meta, args, out_dir):
                 threads=args.threads, tmp_dir=tmp_dir, tag="isfinder",
                 allow_fallback=args.allow_python_fallback, aligner=args.nuc_aligner,
             )
+
+        # Drop UniVec hits that are simply an IS transposase embedded inside a shuttle vector (>= 70% overlap with IS)
+        if vec_hits and is_hits:
+            for fid in list(vec_hits):
+                ihs = is_hits.get(fid, [])
+                if not ihs:
+                    continue
+                clean_v = []
+                for vh in vec_hits[fid]:
+                    vlen = max(1, vh["qend0"] - vh["qstart0"])
+                    is_ov = sum(
+                        max(0, min(vh["qend0"], ih["qend0"]) - max(vh["qstart0"], ih["qstart0"]))
+                        for ih in ihs
+                    )
+                    if is_ov / vlen < 0.70:
+                        clean_v.append(vh)
+                if clean_v:
+                    vec_hits[fid] = clean_v
+                else:
+                    del vec_hits[fid]
 
         # Layer 2c: ORF calling + mobileOG-db protein MGE search
         orf_counts = collections.Counter()

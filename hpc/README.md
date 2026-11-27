@@ -209,3 +209,15 @@ You can verify the entire global fetch-run-compare-annotate workflow offline loc
 ```bash
 bash hpc/test_global_local.sh
 ```
+
+### Running Locally on a Laptop / Workstation (e.g. 16 GB MacBook Air M4)
+
+If your HPC queue is busy, `hpc/run_global_local.py` runs the exact same manifest locally using **1 compute worker (`--threads 8 --max-mem 8`) + 1 background prefetcher** with a strict SSD free-space guard (`--min-free-gb 25`) and immediate per-sample FASTQ/assembly cleanup:
+
+```bash
+python3 hpc/run_global_local.py \
+  --manifest global_run/global_2023_2024_100.tsv \
+  --db-env global_run/dbs/db_paths.env \
+  --out global_run/out_2023_2024 \
+  --threads 8 --max-mem 8 --prefetch 1 --min-free-gb 25
+```

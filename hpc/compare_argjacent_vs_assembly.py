@@ -257,6 +257,14 @@ def load_manifest_meta(path):
     return meta
 
 
+def gene_family(gene_name):
+    """Collapse ResFinder allele suffixes (e.g. erm(B)_10_U86375 -> erm(B), tet(Q)_1_L33696 -> tet(Q))."""
+    parts = gene_name.split("_")
+    if len(parts) >= 3 and parts[1].isdigit():
+        return parts[0]
+    return gene_name
+
+
 def summarize_group(label, rows):
     n = len(rows)
     cats = collections.Counter(r["category"] for r in rows)
@@ -271,12 +279,29 @@ def summarize_group(label, rows):
     concord_98 = sum(1 for v in ids if v >= 98.0)
     med_a = statistics.median([r["argj_certain_bp"] for r in rows]) if rows else 0
     med_m = statistics.median([r["asm_max_bp"] for r in rows]) if rows else 0
+
+    # Family-deduplicated counts (1 count per unique (sample, gene_family, side))
+    by_fam = collections.defaultdict(list)
+    for r in rows:
+        by_fam[(r["sample"], gene_family(r["gene"]), r["side"])].append(r)
+    fam_a_1kb = sum(1 for rs in by_fam.values() if max(x["argj_certain_bp"] for x in rs) >= 1000)
+    fam_m_1kb = sum(1 for rs in by_fam.values() if max(x["asm_max_bp"] for x in rs) >= 1000)
+    fam_a_only = sum(1 for rs in by_fam.values() if max(x["argj_certain_bp"] for x in rs) >= 1000 and max(x["asm_max_bp"] for x in rs) < 1000)
+    fam_m_only = sum(1 for rs in by_fam.values() if max(x["argj_certain_bp"] for x in rs) < 1000 and max(x["asm_max_bp"] for x in rs) >= 1000)
+    fam_cliff = sum(1 for rs in by_fam.values() if max(x["asm_past_cliff_bp"] for x in rs) >= 500)
+
     return {
         "group": label,
         "samples": len({r["sample"] for r in rows}),
         "gene_sides": n,
+        "family_sides": len(by_fam),
         "argj_1kb": a_1kb,
         "asm_1kb": m_1kb,
+        "argj_1kb_families": fam_a_1kb,
+        "asm_1kb_families": fam_m_1kb,
+        "argj_only_1kb_families": fam_a_only,
+        "asm_only_1kb_families": fam_m_only,
+        "asm_past_cliff_families": fam_cliff,
         "argj_5kb": a_5kb,
         "asm_5kb": m_5kb,
         "argj_multi_ctx": multi_a,
