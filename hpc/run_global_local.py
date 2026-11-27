@@ -109,7 +109,7 @@ def download_file(url, dst, env):
         urls = [url]
 
     last_err = None
-    for attempt in range(4):
+    for attempt in range(6):
         for u in urls:
             is_https_ena = u.startswith("https://ftp.sra.ebi.ac.uk/")
             cmd = [
@@ -125,7 +125,7 @@ def download_file(url, dst, env):
                 os.replace(tmp, dst)
                 return
             last_err = subprocess.CalledProcessError(res.returncode, cmd)
-        time.sleep(15 * (attempt + 1))
+        time.sleep(min(60, 10 * (attempt + 1)))
     raise last_err
 
 
@@ -191,17 +191,19 @@ def stage_sample(row, scratch_root, out_dir, args, env):
     r1_dst = os.path.join(s_tmp, f"{sid}_1.fastq.gz")
     r2_dst = os.path.join(s_tmp, f"{sid}_2.fastq.gz")
 
-    # Download R1 then R2 politely (single stream avoids ENA per-IP connection throttling!)
-    download_file(r1_url, r1_dst, env)
-    download_file(r2_url, r2_dst, env)
-
+    # Download R1 and R2 concurrently (2 streams per sample cuts latency ~2x while staying polite to ENA)
     asm_url = row.get("logan_url") if (args.use_logan and row.get("logan_url")) else (row.get("assembly_url") or row.get("assembly"))
     asm_label = f"logan:{sid}" if (args.use_logan and row.get("logan_url")) else (row.get("erz_accession") or "assembly")
     asm_dst = ""
+    dl_jobs = [(r1_url, r1_dst), (r2_url, r2_dst)]
     if not args.skip_assembly and asm_url:
         ext = ".fa.zst" if asm_url.endswith(".zst") else (".fa" if asm_url.endswith((".fa", ".fna", ".fasta")) else ".fasta.gz")
         asm_dst = os.path.join(s_tmp, f"{sid}{ext}")
-        download_file(asm_url, asm_dst, env)
+        dl_jobs.append((asm_url, asm_dst))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futs = [pool.submit(download_file, u, d, env) for u, d in dl_jobs]
+        for fut in futs:
+            fut.result()
 
     dl_s = time.time() - t0
     return {
@@ -272,7 +274,7 @@ def process_staged(staged, out_dir, kma_db, kma_ref_fa, shared_genes, args, env)
                 open(os.path.join(s_out, f"{sid}.pairs.tsv"), "w").write(
                     "gene\tpair_id\tleft_context\tright_context\tleft_certain_bp\tright_certain_bp\tleft_depth\tright_depth\ttier\tscore\tnote\n"
                 )
-                json.dump({"version": "0.5.1", "flank_bp": args.flank_bp, "aw_stats": {}, "parameters": {}, "genes": {}},
+                json.dump({"version": "0.6.0", "flank_bp": args.flank_bp, "aw_stats": {}, "parameters": {}, "genes": {}},
                           open(os.path.join(s_out, f"{sid}.flanks.json"), "w"))
                 json.dump({"version": "asm_flanks_v1", "source": staged["asm_label"], "flank_bp": args.flank_bp, "genes": {}},
                           open(os.path.join(s_out, f"{sid}.asm_flanks.json"), "w"))
