@@ -978,7 +978,7 @@ static void pass_on(uint32_t ui, float m, int dir, int32_t lo, int32_t hi) {
             tot += E->count;
         }
     }
-    if (tot <= 0) {
+    if (tot <= 0 && (EPS <= 0 || m >= 0.025 * Tlive)) {
         want_mate = 1;
         uint32_t deg_m = 0, max_m = 0;
         for (uint32_t x = 0; x < nr.deg; x++) {
@@ -1000,6 +1000,7 @@ static void pass_on(uint32_t ui, float m, int dir, int32_t lo, int32_t hi) {
         int32_t cv = cu + dir * E->dist;
         if (cv > hi || cv < lo) continue;
         float share = (float)(m * E->count / tot);
+        if (want_mate && EPS > 0 && E->count == 1) share *= 0.5f;
         uint32_t vi = ws_get(E->to); WS *v = &ws[vi];
         if (v->placed) {                                  /* placed before */
             if (v->seed) continue;                        /* gene anchors are sources, they take no share */

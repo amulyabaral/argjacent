@@ -32,6 +32,7 @@ import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HPC_DIR = os.path.dirname(os.path.abspath(__file__))
+ENA_SEM = threading.Semaphore(1)  # Strictly at most 1 concurrent TCP connection to ftp.sra.ebi.ac.uk to prevent 403/52 throttling
 
 
 def build_env(extra_bins=None):
@@ -97,11 +98,12 @@ def free_gb(path):
     return shutil.disk_usage(path).free / (1024 ** 3)
 
 
-def download_file(url, dst, env):
+def download_file(url, dst, env, max_attempts=6):
     if os.path.isfile(url):
         shutil.copy2(url, dst)
         return
     tmp = dst + ".part"
+    is_ena = "ftp.sra.ebi.ac.uk/" in url
     # Prefer plain HTTP first for ENA FTP mirrors (avoids ENA port-443 TLS drops & connection refusals)
     if url.startswith("https://ftp.sra.ebi.ac.uk/"):
         urls = ["http://" + url[len("https://"):], url]
@@ -109,23 +111,34 @@ def download_file(url, dst, env):
         urls = [url]
 
     last_err = None
-    for attempt in range(6):
+    for attempt in range(max_attempts):
         for u in urls:
             is_https_ena = u.startswith("https://ftp.sra.ebi.ac.uk/")
             cmd = [
                 "curl", "-fL", "-C", "-",
-                "--retry", "2" if is_https_ena else "5",
+                "--retry", "2" if is_https_ena else "4",
                 "--retry-delay", "5", "--retry-all-errors",
                 "--connect-timeout", "10" if is_https_ena else "30",
                 "--speed-limit", "10000", "--speed-time", "60",
                 "--max-time", "3600", "-sS", "-o", tmp, u,
             ]
-            res = subprocess.run(cmd, env=env)
+            if is_ena:
+                with ENA_SEM:
+                    res = subprocess.run(cmd, env=env)
+                    time.sleep(1.0)
+            else:
+                res = subprocess.run(cmd, env=env)
             if res.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
                 os.replace(tmp, dst)
                 return
+            # Fast-fail 404 on S3 mirror so caller can fall back immediately
+            if not is_ena and res.returncode == 22:
+                shutil.rmtree(tmp, ignore_errors=True)
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                raise subprocess.CalledProcessError(res.returncode, cmd)
             last_err = subprocess.CalledProcessError(res.returncode, cmd)
-        time.sleep(min(60, 10 * (attempt + 1)))
+        time.sleep(min(90, 15 * (attempt + 1)))
     raise last_err
 
 
@@ -174,8 +187,9 @@ def atomic_copy(src, dst):
 
 
 def stage_sample(row, scratch_root, out_dir, args, env):
-    """Download R1, R2, and pre-made assembly into scratch_root/<sample>/."""
+    """Stage SRA (via AWS S3 Open Data, falling back to single-stream ENA FASTQs) + pre-made assembly into scratch_root/<sample>/."""
     sid = row["sample"]
+    run_acc = (row.get("run_accession") or sid).strip()
     s_tmp = os.path.join(scratch_root, sid)
     shutil.rmtree(s_tmp, ignore_errors=True)
     os.makedirs(s_tmp, exist_ok=True)
@@ -190,28 +204,52 @@ def stage_sample(row, scratch_root, out_dir, args, env):
     r2_url = row.get("r2_url") or row.get("r2")
     r1_dst = os.path.join(s_tmp, f"{sid}_1.fastq.gz")
     r2_dst = os.path.join(s_tmp, f"{sid}_2.fastq.gz")
+    sra_dst = ""
 
-    # Download R1 and R2 concurrently (2 streams per sample cuts latency ~2x while staying polite to ENA)
+    fqdump = shutil.which("fasterq-dump", path=env["PATH"])
+    used_s3 = False
+    if fqdump and not args.no_s3 and run_acc.startswith(("SRR", "ERR", "DRR")):
+        s3_url = f"https://sra-pub-run-odp.s3.amazonaws.com/sra/{run_acc}/{run_acc}"
+        cand_sra = os.path.join(s_tmp, f"{sid}.sra")
+        try:
+            download_file(s3_url, cand_sra, env, max_attempts=3)
+            sra_dst = cand_sra
+            r1_dst = r2_dst = ""
+            used_s3 = True
+        except Exception:
+            if os.path.exists(cand_sra):
+                os.remove(cand_sra)
+
+    if not used_s3:
+        download_file(r1_url, r1_dst, env)
+        download_file(r2_url, r2_dst, env)
+
     asm_url = row.get("logan_url") if (args.use_logan and row.get("logan_url")) else (row.get("assembly_url") or row.get("assembly"))
     asm_label = f"logan:{sid}" if (args.use_logan and row.get("logan_url")) else (row.get("erz_accession") or "assembly")
     asm_dst = ""
-    dl_jobs = [(r1_url, r1_dst), (r2_url, r2_dst)]
-    if not args.skip_assembly and asm_url:
+    cached_asm_dir = ""
+    if args.asm_cache_dir and not args.use_logan:
+        cdir = os.path.join(args.asm_cache_dir, sid)
+        if (os.path.isfile(os.path.join(cdir, f"{sid}.asm_flanks.json"))
+                and os.path.isfile(os.path.join(cdir, f"{sid}.asm_flanks.fa"))
+                and os.path.isfile(os.path.join(cdir, f"{sid}.asm_contexts.tsv"))):
+            cached_asm_dir = cdir
+    if not args.skip_assembly and asm_url and not cached_asm_dir:
         ext = ".fa.zst" if asm_url.endswith(".zst") else (".fa" if asm_url.endswith((".fa", ".fna", ".fasta")) else ".fasta.gz")
         asm_dst = os.path.join(s_tmp, f"{sid}{ext}")
-        dl_jobs.append((asm_url, asm_dst))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futs = [pool.submit(download_file, u, d, env) for u, d in dl_jobs]
-        for fut in futs:
-            fut.result()
+        download_file(asm_url, asm_dst, env)
 
     dl_s = time.time() - t0
     return {
         "row": row,
         "tmp": s_tmp,
+        "sra": sra_dst,
         "r1": r1_dst,
         "r2": r2_dst,
+        "r1_url": r1_url,
+        "r2_url": r2_url,
         "asm": asm_dst,
+        "cached_asm_dir": cached_asm_dir,
         "asm_label": asm_label,
         "dl_s": dl_s,
     }
@@ -229,6 +267,35 @@ def process_staged(staged, out_dir, kma_db, kma_ref_fa, shared_genes, args, env)
     try:
         t_comp0 = time.time()
         r1, r2 = staged["r1"], staged["r2"]
+        if staged.get("sra") and os.path.isfile(staged["sra"]):
+            fqdump = shutil.which("fasterq-dump", path=env["PATH"])
+            unpacked_ok = False
+            if fqdump:
+                while free_gb(out_dir) < max(16.0, args.min_free_gb - 6.0):
+                    time.sleep(3.0)
+                rc_fq = subprocess.run(
+                    [fqdump, staged["sra"], "-O", s_tmp, "-t", s_tmp, "-e", str(args.threads), "--split-3", "--skip-technical"],
+                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                if os.path.exists(staged["sra"]):
+                    os.remove(staged["sra"])
+                unmated = os.path.join(s_tmp, f"{sid}.fastq")
+                if os.path.exists(unmated):
+                    os.remove(unmated)
+                cand_r1 = os.path.join(s_tmp, f"{sid}_1.fastq")
+                cand_r2 = os.path.join(s_tmp, f"{sid}_2.fastq")
+                if rc_fq.returncode == 0 and os.path.isfile(cand_r1) and os.path.isfile(cand_r2) and os.path.getsize(cand_r1) > 0:
+                    r1, r2 = cand_r1, cand_r2
+                    unpacked_ok = True
+                else:
+                    for p in (cand_r1, cand_r2):
+                        if os.path.exists(p):
+                            os.remove(p)
+            if not unpacked_ok:
+                r1 = os.path.join(s_tmp, f"{sid}_1.fastq.gz")
+                r2 = os.path.join(s_tmp, f"{sid}_2.fastq.gz")
+                download_file(staged["r1_url"], r1, env)
+                download_file(staged["r2_url"], r2, env)
 
         # 1. Optional fastp trimming (and immediate deletion of raw FASTQs)
         if not args.skip_fastp and shutil.which("fastp", path=env["PATH"]):
@@ -308,7 +375,13 @@ def process_staged(staged, out_dir, kma_db, kma_ref_fa, shared_genes, args, env)
         # 4. Extract pre-made assembly flanks + per-sample comparison (then delete assembly FASTA!)
         asm_s = 0.0
         argj_1kb = asm_1kb = multi_wins = past_cliff = 0
-        if staged["asm"] and os.path.isfile(staged["asm"]):
+        has_asm_flanks = False
+        if staged.get("cached_asm_dir"):
+            t_m0 = time.time()
+            for ext in (".asm_flanks.json", ".asm_contexts.tsv", ".asm_flanks.fa"):
+                atomic_copy(os.path.join(staged["cached_asm_dir"], sid + ext), local_pre + ext)
+            has_asm_flanks = True
+        elif staged["asm"] and os.path.isfile(staged["asm"]):
             t_m0 = time.time()
             subprocess.run(
                 [
@@ -320,6 +393,8 @@ def process_staged(staged, out_dir, kma_db, kma_ref_fa, shared_genes, args, env)
                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
             )
             os.remove(staged["asm"])
+            has_asm_flanks = True
+        if has_asm_flanks:
             subprocess.run(
                 [
                     sys.executable, os.path.join(HPC_DIR, "compare_argjacent_vs_assembly.py"),
@@ -471,6 +546,8 @@ def main():
     ap.add_argument("--kma-min-cov", type=float, default=60.0)
     ap.add_argument("--asm-aligner", default="auto", choices=("auto", "minimap2", "blastn", "kmer"))
     ap.add_argument("--use-logan", action="store_true", help="Compare against Logan S3 contigs instead of ENA ERZ")
+    ap.add_argument("--no-s3", action="store_true", help="Disable AWS S3 SRA Open Data staging (use ENA FASTQs directly)")
+    ap.add_argument("--asm-cache-dir", default="", help="Optional existing samples/ dir with pre-extracted .asm_flanks.* to reuse")
     ap.add_argument("--skip-fastp", action="store_true")
     ap.add_argument("--skip-assembly", action="store_true")
     ap.add_argument("--cohort-min-samples", type=int, default=4)

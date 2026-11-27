@@ -46,7 +46,7 @@
 #define REDO 0              /* the gene part is the seed as given; reads are laid on it with differences tolerated */
 #define MAXQ 512
 #define LA 60
-static int K2 = 16, SAMP = 4, PATCH = 1, RESCUE = 3;
+static int K2 = 16, SAMP = 8, PATCH = 1, RESCUE = 3;
 #ifndef ALTMAX
 #define ALTMAX 64
 #endif
@@ -207,6 +207,15 @@ static int has_junk_tail(uint32_t r, int sd, int off0) {
    (2) unambiguous K2=19 read-tip overlaps (19..43 bp, 0 mismatches, <= 32 bucket hits, >= 80% 10-bp forward agreement). */
 static int rescue_stall(St *s) {
     if (s->len < K) return 0;
+    /* Only invoke low-coverage stall rescue when recent 500-bp depth is low-to-moderate (<= ~11x);
+       avoids scanning large placement tables at high-depth repeat dead ends. */
+    int n_up500 = 0;
+    for (uint32_t h = 0; h <= s->pmask; h++) {
+        if (!s->pm[h].k) continue;
+        if ((s->pm[h].k & 1) == 0 && s->pm[h].d >= s->len - 500 && s->pm[h].d < s->len) {
+            if (++n_up500 > 36) return 0;
+        }
+    }
     int added = 0;
     int min_mate_ov = RESCUE >= 2 ? 10 : 14;
     /* 1. Mate-anchored FR short-overlap / 1-2 mismatch rescue */
@@ -269,7 +278,7 @@ static int rescue_stall(St *s) {
             const PE *em = pm_find(s, m);
             if (em && (int)(em->k & 1) == sd_m && em->d + L_m > s->len) continue;
             if (has_junk_tail(m, sd_m, 0)) continue;
-            for (int o_m = 0; o_m <= 24 && o_m + K <= L_m && !added; o_m += 12) {
+            for (int o_m = 0; o_m <= 15 && o_m + K <= L_m && !added; o_m++) {
                 uint64_t km = 0, rc = 0; int bad = 0;
                 for (int i = 0; i < K; i++) {
                     uint8_t b = rb(m, sd_m, o_m + i) & 7;
@@ -430,7 +439,7 @@ static int rescue_stall(St *s) {
     /* 2. Unambiguous K2 read-tip index rescue (strict 0-mismatch over flank overlap!) */
     if (!ix2 || s->len < K2 + 3) return 0;
     uint32_t cr[64]; int csd[64], cd[64], nc = 0;
-    int sh_lim = RESCUE >= 2 ? 2 : 4, max_k2_ov = RESCUE >= 2 ? 55 : 43, max_bkt = RESCUE >= 2 ? 24 : 32;
+    int sh_lim = 4, max_k2_ov = RESCUE >= 2 ? 55 : 43, max_bkt = RESCUE >= 2 ? 24 : 32;
     for (int sh = 0; sh < sh_lim; sh++) {
         int p0 = s->len - K2 - sh;
         if (p0 < 0) break;
@@ -760,10 +769,10 @@ int main(int argc, char **argv) {
         if (!samp_set) SAMP = 8;
     } else if (RESCUE == 2) {
         if (!k2_set) K2 = 17;
-        if (!samp_set) SAMP = 4;
+        if (!samp_set) SAMP = 8;
     } else if (RESCUE >= 3) {
         if (!k2_set) K2 = 16;
-        if (!samp_set) SAMP = 4;
+        if (!samp_set) SAMP = 8;
     }
     if (K2 < 14) K2 = 14;
     if (K2 > 24) K2 = 24;
@@ -831,11 +840,11 @@ int main(int argc, char **argv) {
         for (int i = 0; i < nt; i++) if (pthread_create(&sth[i], NULL, sort_worker, NULL)) { perror("awx: cannot start a thread"); return 1; }
         for (int i = 0; i < nt; i++) pthread_join(sth[i], NULL);
     }
-    if (RESCUE) {
+    if (RESCUE && nr <= 12000000U) {
         pt2 = calloc(((size_t)1 << PB2) + 2, 4);
         if (!pt2) { fprintf(stderr, "awx: out of memory while building tip index\n"); return 2; }
         const uint64_t kmask2 = (1ULL << (2 * K2)) - 1;
-        const int tip_lim = RESCUE >= 2 ? 36 : 24, tip_mask = RESCUE >= 2 ? 1 : 3;
+        const int tip_lim = (RESCUE >= 2 ? (nr <= 6000000U ? 28 : 12) : 24), tip_mask = 3;
         for (int go = 0; go < 2; go++) {
             for (uint32_t r = 0; r < nr; r++) {
                 int L = rd[r].len; if (L < K2) continue;
