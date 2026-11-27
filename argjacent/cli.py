@@ -326,9 +326,9 @@ def main(argv=None):
                          "gene's reads still on their way at that distance (default 0.002; 0 = follow everything)")
     ap.add_argument("--save-map", metavar="FILE", help="save the map of the sample made in the first read pass")
     ap.add_argument("--map", metavar="FILE", help="use a saved map instead of the first read pass (same -k and -w)")
-    ap.add_argument("-w", type=int, default=20,
-                    help="anchor window (default 20). 40 needs about 40%% less memory in the read passes; fewer reads are kept")
-    ap.add_argument("-k", type=int, default=31, help="k-mer size of the anchors, 11-32 (default 31)")
+    ap.add_argument("-w", type=int, default=11,
+                    help="anchor window (default 11). Larger windows (e.g. 20 or 40) use less memory in the read passes")
+    ap.add_argument("-k", type=int, default=21, help="k-mer size of the anchors, 11-32 (default 21)")
     ap.add_argument("-b", type=int, default=None,
                     help="log2 of Bloom filter bits (default: chosen from input size; aw warns if too small)")
     ap.add_argument("--max-anchors", type=int, default=2000000, help="hard limit of anchors reached per gene side (default 2,000,000)")
@@ -431,15 +431,24 @@ def run(a, bins, genes, tmp):
     if short:
         print("  note: %d genes are shorter than k (%d bp) and cannot be found: %s" % (len(short), a.k, ", ".join(short[:5])))
     print("[1/4] Reading the reads %s (map, walk, fetch) ..." % ("once, map from file" if a.map else "twice"), flush=True)
-    cmd = [bins["aw"], "-k", str(a.k), "-w", str(a.w), "-D", str(a.flank), "-b", str(bits), "-p", str(a.min_share), "-M", str(a.max_anchors),
-           "-t", str(a.threads)]
+    no_bloom = os.environ.get("ARGJ_NO_BLOOM") == "1"
+    cmd = [bins["aw"], "-k", str(a.k), "-w", str(a.w), "-D", str(a.flank)]
+    if no_bloom:
+        cmd += ["-B"]
+    else:
+        cmd += ["-b", str(bits)]
+    cmd += ["-p", str(a.min_share), "-M", str(a.max_anchors), "-t", str(a.threads)]
     if budget and not a.map:
         # the map and its Bloom filter may take the memory allowed but for a tenth of it (256 MB at most), which is left
         # for the reads on their way through; a map that does not fit is built in parts
-        while bits > 24 and (1 << (bits - 3)) / 1048576.0 > 0.35 * budget and not a.b:
-            bits -= 1                                       # a filter that would take over a third of the memory: a smaller one
-        cmd[cmd.index("-b") + 1] = str(bits)
+        if not no_bloom:
+            while bits > 24 and (1 << (bits - 3)) / 1048576.0 > 0.35 * budget and not a.b:
+                bits -= 1                                       # a filter that would take over a third of the memory: a smaller one
+            cmd[cmd.index("-b") + 1] = str(bits)
         cmd += ["-m", "%.1f" % (budget - min(0.1 * budget, 256.0))]
+    if os.environ.get("ARGJ_AW_EXTRA"):
+        import shlex
+        cmd += shlex.split(os.environ["ARGJ_AW_EXTRA"])
     if os.environ.get("AW_TEST_PARTS"):                    # tests only: build the map in this many parts
         cmd += ["-P", os.environ["AW_TEST_PARTS"]]
     if a.map:
@@ -601,12 +610,16 @@ def run(a, bins, genes, tmp):
         for c in cands.get(i, []):
             v = ver.get(i, {}).get("%d|%s|%d|%d|0|0" % (i, c["side"], c["cand"], c["gene_part"]))
             fl = c["seq"][c["gene_part"]:]
-            certain = 0 if (v is None or no_claims) else max(0, min(v["verified"], len(fl)) - cut)
+            term_ok = (v is not None and not no_claims
+                       and c.get("gene_end_diffs_near", 0) <= pipeline.MAXNEAR
+                       and c.get("gene_end_diffs_tip", 0) <= pipeline.MAXTIP)
+            certain = max(0, min(v["verified"], len(fl)) - cut) if term_ok else 0
             # The end claim says "a context of a gene that ENDS like this one": only for a candidate whose own last 100 gene bases
             # are like the gene's. A sample's gene end may differ from the gene in up to 30 of its last 300 bases; where those
-            # crowd into the last 100, the candidate carries a relative's end (two-strain E. coli case, 20 Nov 2026: a relative
-            # 83 % like the gene over its last 100 bases had its flank called certain for 1,821 bases under the end claim).
-            end_ok = v is not None and not no_claims and c.get("gene_end_diffs_near", 0) <= pipeline.NEARDIFF
+            # crowd into the last 100 (or >= 10 into the terminal 30-bp boundary, e.g. cfxA6 vs cfxA5 C-terminal divergence),
+            # the candidate carries a relative's end (two-strain E. coli case, 20 Nov 2026: a relative 83 % like the gene over
+            # its last 100 bases had its flank called certain for 1,821 bases under the end claim).
+            end_ok = term_ok and c.get("gene_end_diffs_near", 0) <= pipeline.NEARDIFF
             end = max(certain, max(0, min(v["verified_end"], len(fl)) - cut)) if end_ok else certain
             p = {"flank": fl if c["side"] == "right" else fl.translate(COMP)[::-1], "flank_len": len(fl), "context_len": certain,
                  "end_len": end, "shared_end": v["shared_end"] if v else 0,
@@ -618,6 +631,7 @@ def run(a, bins, genes, tmp):
                  "stop": STOPS.get(c["stop"], c["stop"].replace(" ", "_")),
                  "certain_stop": (v["stop"] if not no_claims else "reads_too_short") if v else "failed",
                  "main": c["cand"] == 1, "gene_end": c["gene_end"], "gene_end_diffs": c["gene_end_diffs"],
+                 "gene_end_diffs_near": c.get("gene_end_diffs_near", 0),
                  "joins": v["joins"] if v else 0, "open_joins": v["open_joins"] if v else 0,
                  "genes": [dict(x, certain=x["to_bp"] <= certain) for x in og.get((i, c["side"], c["cand"]), [])]}
             sides[c["side"]].append(p)

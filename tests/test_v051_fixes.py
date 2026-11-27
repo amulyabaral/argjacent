@@ -388,3 +388,163 @@ def test_load_cohort_inputs_caches_genes_fa_and_binary_versions(tmp_path):
         r = subprocess.run([b, "-v"], capture_output=True, text=True)
         assert r.returncode == 0
         assert VERSION in r.stdout, (name, r.stdout, VERSION)
+
+
+def test_terminal_crowded_allele_hijack_rejected_while_uniform_ortholog_kept(tmp_path):
+    """Reproduces the real-world CPH_RA sewage cfxA6 vs cfxA5 C-terminal hijack:
+    1) If r300 walks onto a co-occurring relative with 20 mismatches crowded into the last
+       30 bp (total d300=20 <= 30, but d100=20 > 15 and d30=20 > 9), pipeline.merge() must
+       reject that relative-terminus hijack and fall back to r0 (the database allele's true flank).
+    2) An r300 candidate with 17 mismatches crowded into the last 100 bp (83 % local identity,
+       d100=17 > 15) is likewise rejected and falls back to r0.
+    3) A genuinely ~90.7 %-identical ortholog with 28 mismatches distributed uniformly across
+       the 300-bp REDO window (9 in last 100 bp, 3 in last 30 bp, e.g. Klebsiella OqxA) is kept.
+    """
+    from argjacent import pipeline
+
+    rng = random.Random(516)
+    gene_cfx = _rand_seq(rng, 996)
+    gene_ecoli = _rand_seq(rng, 900)
+    gene_oqxa = _rand_seq(rng, 1100)
+    genes = [("cfxA6", gene_cfx), ("rel83", gene_ecoli), ("OqxA", gene_oqxa)]
+
+    def mut_at(seq, positions):
+        arr = list(seq)
+        for p in positions:
+            arr[p] = rng.choice([b for b in "ACGT" if b != arr[p]])
+        return "".join(arr)
+
+    fl_true_cfx = _rand_seq(rng, 718)
+    fl_hijack_cfx5 = _rand_seq(rng, 927)
+    fl_true_ecoli = _rand_seq(rng, 600)
+    fl_hijack_ecoli = _rand_seq(rng, 1800)
+    fl_oqxa_sample = _rand_seq(rng, 1500)
+
+    # 1) cfxA6: 20 mismatches crowded into the terminal 30 bp [370..400)
+    end_cfx = gene_cfx[-400:]
+    hijack_cfx = mut_at(end_cfx, list(range(370, 390)))
+
+    # 2) rel83: 17 mismatches in [300..370) (d300=17 <= 30, d30=0 <= 9, but d100=17 > 15)
+    end_ecoli = gene_ecoli[-400:]
+    hijack_ecoli = mut_at(end_ecoli, list(range(300, 368, 4)))  # 17 sites in [300..364]
+
+    # 3) OqxA: 28 mismatches uniformly spaced across [100..400) -> d300=28, d100=9, d30=3
+    end_oqxa = gene_oqxa[-400:]
+    unif_oqxa = mut_at(end_oqxa, list(range(105, 396, 10))[:28])
+
+    pre = str(tmp_path / "x")
+    cdir = str(tmp_path / "c")
+    os.makedirs(cdir)
+
+    def write_run(redo, rows):
+        with open("%s.r%d.fa" % (pre, redo), "w") as fa, open("%s.r%d.tsv" % (pre, redo), "w") as tsv:
+            tsv.write("gene\tside\tcand\tflank\tstop\tborn_at\tpenalty\tvariants\tforks\tone_read\tjoin_first\tmass_end\n")
+            for gi, side, cid, gl, seq, stop in rows:
+                fa.write(">%d|%s|%d|%d|0|0\n%s\n" % (gi, side, cid, gl, seq))
+                tsv.write("%d\t%s\t%d\t%d\t%s\t0\t0\t0\t0\t0\t-99999\t1.0000\n" % (gi, side, cid, len(seq) - gl, stop))
+
+    write_run(0, [
+        (0, "right", 1, 400, end_cfx + fl_true_cfx, "reached target"),
+        (1, "right", 1, 400, end_ecoli + fl_true_ecoli, "reached target"),
+        (2, "right", 1, 400, end_oqxa, "ran out of reads"),
+    ])
+    write_run(300, [
+        (0, "right", 1, 400, hijack_cfx + fl_hijack_cfx5, "reached target"),
+        (1, "right", 1, 400, hijack_ecoli + fl_hijack_ecoli, "reached target"),
+        (2, "right", 1, 400, unif_oqxa + fl_oqxa_sample, "reached target"),
+    ])
+
+    cands, st = pipeline.merge(genes, pre, cdir)
+    # cfxA6 and rel83 both reject the crowded relative end and recover their true r0 flank!
+    assert len(cands[0]) == 1 and cands[0][0]["gene_end"] == "database"
+    assert cands[0][0]["seq"][400:] == fl_true_cfx
+    assert len(cands[1]) == 1 and cands[1][0]["gene_end"] == "database"
+    assert cands[1][0]["seq"][400:] == fl_true_ecoli
+    # OqxA keeps its uniform ~90.7 %-identical sample allele!
+    assert len(cands[2]) == 1 and cands[2][0]["gene_end"] == "sample"
+    assert cands[2][0]["gene_end_diffs"] == 28
+    assert cands[2][0]["gene_end_diffs_near"] <= pipeline.MAXNEAR
+    assert cands[2][0]["gene_end_diffs_tip"] <= pipeline.MAXTIP
+    assert cands[2][0]["seq"][400:] == fl_oqxa_sample
+    assert st["sides_database_end"] == 2 and st["sides_sample_end"] == 1
+    assert st["sides_sample_end_too_far"] == 2 and st["dropped_too_far"] == 0
+
+
+def test_end_to_end_cooccurring_cterminal_alleles_do_not_bleed(tmp_path):
+    """End-to-end simulation of cfxA6 (12x) co-occurring with cfxA5 (45x), sharing 966 bp identically
+    except for a 20-bp mismatch in the terminal 30 bp of cfxA6: ARGjacent must certify cfxA6's own
+    true right flank rather than hijacking onto cfxA5's higher-depth right flank.
+    """
+    rng = random.Random(517)
+    shared_core = _rand_seq(rng, 966)
+    tail_cfx6 = _rand_seq(rng, 30)
+    # Mutate 20 of the 30 terminal bases to form cfxA5's 3' terminus
+    tail_cfx5 = list(tail_cfx6)
+    for idx in range(0, 30, 3):
+        tail_cfx5[idx] = rng.choice([b for b in "ACGT" if b != tail_cfx5[idx]])
+    for idx in range(1, 30, 3):
+        tail_cfx5[idx] = rng.choice([b for b in "ACGT" if b != tail_cfx5[idx]])
+    tail_cfx5 = "".join(tail_cfx5)  # exactly 20 diffs in last 30 bp
+
+    gene_cfx6 = shared_core + tail_cfx6
+    gene_cfx5 = shared_core + tail_cfx5
+    left_6, right_6 = _rand_seq(rng, 1500), _rand_seq(rng, 1500)
+    left_5, right_5 = _rand_seq(rng, 1500), _rand_seq(rng, 1500)
+
+    mol6 = left_6 + gene_cfx6 + right_6
+    mol5 = left_5 + gene_cfx5 + right_5
+
+    genes_fa = str(tmp_path / "genes.fa")
+    with open(genes_fa, "w") as fh:
+        fh.write(">cfxA6\n%s\n>cfxA5\n%s\n" % (gene_cfx6, gene_cfx5))
+
+    r1_fq = str(tmp_path / "R1.fq")
+    r2_fq = str(tmp_path / "R2.fq")
+    pid = 0
+    with open(r1_fq, "w") as f1, open(r2_fq, "w") as f2:
+        for mol, cov in ((mol6, 18), (mol5, 60)):
+            n_pairs = int(cov * len(mol) / 300)
+            for _ in range(n_pairs):
+                ins = max(200, min(450, int(rng.gauss(320, 35))))
+                pos = rng.randrange(0, len(mol) - ins)
+                s1 = mol[pos:pos + 150]
+                s2 = _rc(mol[pos + ins - 150:pos + ins])
+                f1.write("@r%d/1\n%s\n+\n%s\n" % (pid, s1, "I" * 150))
+                f2.write("@r%d/2\n%s\n+\n%s\n" % (pid, s2, "I" * 150))
+                pid += 1
+
+    # 1) Default --max-paths 16: r300 drops the 60x cfxA5 hijack (diffs=20) and keeps cfxA6's true 0-diff path!
+    out_pre = str(tmp_path / "out16")
+    res = subprocess.run(
+        [sys.executable, "-m", "argjacent", "-g", genes_fa, "-1", r1_fq, "-2", r2_fq, "-o", out_pre, "-D", "1200", "-t", "2"],
+        capture_output=True, text=True,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    doc = json.load(open(out_pre + ".flanks.json"))["genes"]
+
+    p6 = doc["cfxA6"]["right"]["paths"]
+    assert len(p6) == 1, p6
+    best6 = p6[0]
+    assert best6["gene_end_diffs"] == 0 and best6["gene_end_diffs_near"] == 0, best6
+    assert best6["context_len"] >= 900, best6
+    assert best6["flank"][:best6["context_len"]] == right_6[:best6["context_len"]]
+    assert not best6["flank"].startswith(right_5[:100])
+
+    best5 = doc["cfxA5"]["right"]["paths"][0]
+    assert best5["context_len"] >= 900, best5
+    assert best5["flank"][:best5["context_len"]] == right_5[:best5["context_len"]]
+
+    # 2) Crowded beam (--max-paths 1): even when cfxA5 (60x) crowds cfxA6 (18x) out of awx's
+    #    single beam slot, pipeline.merge() rejects the hijacked r300 candidate and verify.py
+    #    refuses to certify any chimeric right_5 extension on cfxA6 (context_len == 0)!
+    out_crowded = str(tmp_path / "out1")
+    res1 = subprocess.run(
+        [sys.executable, "-m", "argjacent", "-g", genes_fa, "-1", r1_fq, "-2", r2_fq, "-o", out_crowded,
+         "-D", "1200", "--max-paths", "1", "-t", "2"],
+        capture_output=True, text=True,
+    )
+    assert res1.returncode == 0, res1.stdout + res1.stderr
+    doc1 = json.load(open(out_crowded + ".flanks.json"))["genes"]
+    b6_1 = doc1["cfxA6"]["right"]["paths"][0]
+    assert b6_1["gene_end"] == "database" and b6_1["gene_end_diffs"] == 0, b6_1
+    assert b6_1["context_len"] == 0, b6_1

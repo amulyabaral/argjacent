@@ -9,11 +9,15 @@ position x of a candidate only on evidence that molecules which carry the gene r
   B   budget: the matching reads next to the gene, minus every read seen leaving the path since (charged in the measure
       in which the leaving reads' mates lie on the path towards the gene), still number 8 or more, and stand three
       standard deviations clear of the chance in what was charged (0.4)
-  F   flow: more matching reads cover x than all loci that came on can supply, allowing for chance in both numbers and
+   F   flow: more matching reads cover x than all loci that came on can supply, allowing for chance in both numbers and
       for the supply being known only to about a tenth. What came on is what the reads seen coming on stand for, and at
       least what the depth has risen above its lowest level since the gene (beyond chance): a locus that comes on softly
       is seen by few of its reads (0.4; the faults of 0.3.0 on block E). And it never finds more of the gene's own reads
       than the budget allows at most: what was next to the gene, minus the reads charged as leaving, plus all that came on
+  U   unbranched mate-bridged path (0.6): at low to moderate depth (<= UMAXD), where ZERO foreign reads have entered
+      since g - INSIDE (even singletons), ZERO reads have left since g (even singletons), depth never rises to a
+      multi-copy plateau, and >= 2 concordant paired-end fragments bridge [x - UMARG, x + UMARG] (bridging brief <= UNECK
+      single-pair Poisson necks when >= 2 pairs resume for >= USUST bp beyond)
 
 and in any case only where two reads carry the 31 bases that end at x, where reads carry the 61 bases that end at x if
 the depth on both sides says they should, and where the place is not one that reads do not cross (a hole in the
@@ -40,6 +44,7 @@ History: the rules are those of the fifth-round prototype (benchmarks/dev-tools/
 0.3.0 carried unchanged; 0.4 adds the rise term of the flow rule and the tolerant measure
 (benchmarks/dev-tools/experiments/tol/NOTE).
 """
+import os
 import numpy as np
 
 NARR = 20                 # arrays per candidate in the .i32 file of awv
@@ -116,6 +121,14 @@ SDET = 0.5
 GAP, GAPQ = 0.2, 0.1      # a place reads do not cross: under GAP of the depth carry it, under GAPQ of the depth leave or come on
 CUT = 30                  # bases taken off the end of every verified part before it is called certain
 DEPTH_BIN = 100           # bin width (bp) for compact per-candidate flank depth profiles exported to flanks.json / GFA
+ULEV = True               # Rule U: unbranched zero-join mate-bridged certification for low-depth single-copy loci
+UMAXD = float(os.environ.get("ARGJ_U_MAXD", "20.0"))
+UMARG = int(os.environ.get("ARGJ_U_MARG", "20"))
+UNECK = int(os.environ.get("ARGJ_U_NECK", "90"))
+USUST = int(os.environ.get("ARGJ_U_SUST", "180"))
+UMIN_PSPAN = int(os.environ.get("ARGJ_U_MINPSPAN", "1"))
+U_TG_MIN = int(os.environ.get("ARGJ_U_TGMIN", "1"))
+U_CONCORDANT_1EV = os.environ.get("ARGJ_U_CONC1", "0") == "1"
 
 
 def lcb(n):
@@ -161,6 +174,69 @@ def _group_by_cand(rows):
     return rows, cuts
 
 
+def _cand_fork_limits(pre, idx_rows):
+    """For each candidate ci, find earliest x >= g + 15 where another candidate on the same side
+    shares the prefix up to x and then diverges structurally (>= 10 mismatches in 30 bp)."""
+    n = len(idx_rows)
+    lims = [1 << 29] * n
+    cdir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(pre))), "c")
+    cfa = os.path.join(cdir, os.path.basename(pre) + ".cands.fa")
+    if not os.path.isfile(cfa):
+        return lims
+    seqs = {}
+    cur = None
+    buf = []
+    with open(cfa) as fh:
+        for line in fh:
+            if line.startswith(">"):
+                if cur is not None:
+                    seqs[cur] = "".join(buf)
+                cur = line[1:].strip()
+                buf = []
+            else:
+                buf.append(line.strip())
+        if cur is not None:
+            seqs[cur] = "".join(buf)
+    by_side = {}
+    arrs = []
+    for ci, (name, ln, off, g) in enumerate(idx_rows):
+        s = seqs.get(name, "")
+        arr = np.frombuffer(s.encode("ascii"), dtype=np.uint8) if len(s) == ln else None
+        arrs.append(arr)
+        sd = name.split("|")[1]
+        by_side.setdefault(sd, []).append(ci)
+    for sd, cis in by_side.items():
+        if len(cis) < 2:
+            continue
+        for idx_a in range(len(cis)):
+            ca = cis[idx_a]
+            aa = arrs[ca]
+            ga = idx_rows[ca][3]
+            if aa is None:
+                continue
+            for idx_b in range(idx_a + 1, len(cis)):
+                cb = cis[idx_b]
+                ab = arrs[cb]
+                if ab is None or idx_rows[cb][3] != ga:
+                    continue
+                m = min(len(aa), len(ab))
+                if m <= ga + 30:
+                    continue
+                neq = np.nonzero(aa[ga:m] != ab[ga:m])[0]
+                if not len(neq):
+                    continue
+                fk = ga + int(neq[0])
+                if fk < ga + 10:
+                    continue
+                w_end = min(m, fk + 30)
+                if w_end - fk >= 15 and int(np.sum(aa[fk:w_end] != ab[fk:w_end])) >= max(8, (w_end - fk) // 3):
+                    if fk < lims[ca]:
+                        lims[ca] = fk
+                    if fk < lims[cb]:
+                        lims[cb] = fk
+    return lims
+
+
 def _load_records(pre):
     with open(pre + ".idx") as f:
         idx_rows = []
@@ -172,7 +248,8 @@ def _load_records(pre):
     ent, ecuts = _group_by_cand(np.fromfile(pre + ".ent", dtype=np.int32).reshape(-1, 8))
     lev, lcuts = _group_by_cand(np.fromfile(pre + ".lev", dtype=np.int32).reshape(-1, 8))
     tpl, tcuts = _group_by_cand(np.fromfile(pre + ".tpl", dtype=np.int32).reshape(-1, 3))
-    return idx_rows, blob, ent, ecuts, lev, lcuts, tpl, tcuts
+    fk_lims = _cand_fork_limits(pre, idx_rows)
+    return idx_rows, blob, ent, ecuts, lev, lcuts, tpl, tcuts, fk_lims
 
 
 def verify_gene(pre, read_len=150, detail=None, patches=False):
@@ -198,7 +275,7 @@ def _verify(loaded, read_len, detail, patches, inside, only):
     """loaded: pre-read records of one gene -> one dict per candidate, in the order of the candidate file:
     name (as in the file), flank_len, verified (bp from the gene, before the cut), joins, open_joins, depth, stop.
     patches: the records were made under the tolerant measure (pipeline.TOLERANT)"""
-    idx_rows, blob, ent, ecuts, lev, lcuts, tpl, cuts = loaded
+    idx_rows, blob, ent, ecuts, lev, lcuts, tpl, cuts, fk_lims = loaded
     BUB = bool(patches)
     rc = read_length_constants(read_len)
     eff, rl, farb = rc["eff"], rc["L"], rc["far"]
@@ -219,6 +296,12 @@ def _verify(loaded, read_len, detail, patches, inside, only):
         t = tpl[cuts[ci]:cuts[ci + 1]] if ci + 1 < len(cuts) else tpl[:0]
         st, en = t[:, 1], t[:, 2]
         st_all, en_all = st, en
+        ispair = (en - st) > rl + 2
+        if len(st) >= 3:
+            w0, w1, w2 = en[2:] - st[2:], en[1:-1] - st[1:-1], en[:-2] - st[:-2]
+            m12 = ((st[2:] == st[:-2]) & (en[2:] == en[1:-1])) | ((st[2:] == st[1:-1]) & (en[2:] == en[:-2]))
+            ispair = ispair.copy()
+            ispair[2:] |= m12 & (w0 >= np.maximum(w1, w2))
         if len(st):
             # a pair whose unread middle holds a whole variable stretch (reads leave the path and reads come on again, each
             # cluster at least TFRAC of the depth) may belong to the other version of that stretch: it says nothing here
@@ -238,7 +321,7 @@ def _verify(loaded, read_len, detail, patches, inside, only):
                 pe = EP[np.minimum(j, len(EP) - 1)]
                 c2 = (j < len(EP)) & (pe < g1)
                 keep_t = ~(c1 & c2)
-                st, en = st[keep_t], en[keep_t]
+                st, en, ispair = st[keep_t], en[keep_t], ispair[keep_t]
 
         def thru(p, xs, dl=DELTA):                            # templates that begin before p - DELTA and cover xs
             ends = np.sort(en[st <= p - dl])
@@ -673,6 +756,10 @@ def _verify(loaded, read_len, detail, patches, inside, only):
                     bad_ = np.nonzero(tt < 2)[0]
                     broken = min(broken, int(xs_[bad_[0]]) if len(bad_) else p0 + dstar)
         okG = (tg >= 2) & base
+        gene_in_ev = int(np.sum(A[A_ENTER][max(0, g - 260):max(0, g - 5)] + A[A_RAGL][max(0, g - 260):max(0, g - 5)])) if g >= 220 else 0
+        if ULEV and g >= 220 and gene_in_ev >= 1 and float(ds[min(ln, g)]) <= 12.0 and not gin:
+            if int(thru(max(0, g - 175) + DELTA, np.array([min(ln, g + 15)]))[0]) < 1:
+                okG[:] = False
         okJ = injoin & (tau >= TJ) & base
         if FCAP:
             # The flow rule cannot find more of the gene's own reads than the budget allows at most: what was next to the gene,
@@ -698,7 +785,138 @@ def _verify(loaded, read_len, detail, patches, inside, only):
                 # this; 12 against 9 at a 40 % swing). KNOWN WEAKNESS while this is off.
                 capF = capF - Z * UNEV * np.sqrt(Uq + np.maximum(0.0, np.maximum(Lcum, 0.0) - Lseen) ** 2)
             okF = okF & (np.minimum(own, capF) >= barF)
-        ok = okF | okG | okJ | okB
+        # ---- U: unbranched zero-join mate-bridged path for low-depth single-copy loci
+        okU = np.zeros(ln + 1, dtype=bool)
+        if ULEV and ln > g:
+            g_med = float(np.median(dex[max(0, g - 200):g])) if g > 0 else 0.0
+            f_med = float(np.median(dex[g:min(ln + 1, g + 500)])) if (not joins and ln > g + 80) else 0.0
+            d0_u = max(float(ds[g]), g_med, min(f_med, 2.0 * max(float(ds[g]), g_med, 1.5)), 2.0)
+            if d0_u <= UMAXD and int(tg[min(ln, g + 15)]) >= U_TG_MIN:
+                if len(e):
+                    keep_eu = ~((e[:, 1] < g - NEAR) & (egl == 1))
+                    if BUB:
+                        keep_eu &= ~(eamb & (np.searchsorted(ebub, e[:, 1] + 3, side="right")
+                                             > np.searchsorted(ebub, e[:, 1] - 3, side="left")))
+                    eu = e[keep_eu]
+                    first_ent = ln + 1
+                    if len(eu):
+                        if not U_CONCORDANT_1EV:
+                            first_ent = int(eu[0, 1])
+                        else:
+                            ei = 0
+                            while ei < len(eu):
+                                ej = ei + 1
+                                while ej < len(eu) and eu[ej, 1] - eu[ej - 1, 1] <= 3:
+                                    ej += 1
+                                if ej - ei >= 2:
+                                    first_ent = int(eu[ei, 1])
+                                    break
+                                mt_e, mA_e, a40_e = int(eu[ei, 5]), int(eu[ei, 6]), int(eu[ei, 4]) % 1000
+                                if not (mt_e == -1 and (mA_e >= 0 or mA_e == -2) and a40_e <= 4):
+                                    first_ent = int(eu[ei, 1])
+                                    break
+                                ei = ej
+                else:
+                    first_ent = ln + 1
+                if len(lv):
+                    if BUB:
+                        l2 = (lv[:, 4] // 1000) == 2
+                        has_lb = (np.searchsorted(lbub, lv[:, 3] + 3, side="right")
+                                  > np.searchsorted(lbub, lv[:, 3] - 3, side="left"))
+                        lvu = lv[~(l2 & has_lb)]
+                    else:
+                        lvu = lv
+                    first_lev = ln + 1
+                    if len(lvu):
+                        if not U_CONCORDANT_1EV:
+                            first_lev = int(lvu[0, 3])
+                        else:
+                            li = 0
+                            while li < len(lvu):
+                                lj = li + 1
+                                while lj < len(lvu) and lvu[lj, 3] - lvu[lj - 1, 3] <= 3:
+                                    lj += 1
+                                if lj - li >= 2:
+                                    first_lev = int(lvu[li, 3])
+                                    break
+                                mt_l, mA_l, cr_l = int(lvu[li, 5]), int(lvu[li, 6]), int(lvu[li, 4]) % 1000
+                                if not (mt_l == -1 and (mA_l >= 0 or mA_l == -2) and cr_l <= 4):
+                                    first_lev = int(lvu[li, 3])
+                                    break
+                                li = lj
+                else:
+                    first_lev = ln + 1
+                pst, pen = st[ispair], en[ispair]
+                pspan = np.zeros(ln + 1, dtype=np.int32)
+                pspan_deep = np.zeros(ln + 1, dtype=np.int32)
+                if len(pst):
+                    med_sp = float(np.median(pen - pst))
+                    w_up = min(145, max(UMARG, int(med_sp - 135)))
+                    span_ok = (pen - pst) >= 2 * UMARG
+                    pst_, pen_ = pst[span_ok], pen[span_ok]
+                    if len(pst_):
+                        pa = np.where(pst_ <= 0, 0, pst_ + UMARG)
+                        pb = np.where(pen_ >= ln, ln + 1, pen_ - UMARG + 1)
+                        vp = pb > pa
+                        if vp.any():
+                            pdiff = (np.bincount(np.minimum(ln + 1, pa[vp]), minlength=ln + 2)
+                                     - np.bincount(np.minimum(ln + 1, pb[vp]), minlength=ln + 2))
+                            pspan = np.cumsum(pdiff)[:ln + 1]
+                        pa_d = np.where(pst_ <= 0, 0, pst_ + w_up)
+                        pb_d = np.where(pen_ >= ln, ln + 1, pen_ - 25 + 1)
+                        vp_d = pb_d > pa_d
+                        if vp_d.any():
+                            pdiff_d = (np.bincount(np.minimum(ln + 1, pa_d[vp_d]), minlength=ln + 2)
+                                       - np.bincount(np.minimum(ln + 1, pb_d[vp_d]), minlength=ln + 2))
+                            pspan_deep = np.cumsum(pdiff_d)[:ln + 1]
+                # Require deep-gene anchor only when upstream gene-body events indicate a potential shared-gene-end join
+                if g >= 220 and gene_in_ev >= 1:
+                    deep_g = int(thru(max(0, g - 175) + DELTA, np.array([min(ln, g + 15)]))[0])
+                    if deep_g < 1:
+                        first_ent = g
+                if U_TG_MIN < 2 and int(tg[min(ln, g + 15)]) < 2 and int(pspan[g]) < 1:
+                    first_ent = g
+                cov_u = (A[A_PATH] >= 1) if BUB else (A[A_EXACT] >= 1)
+                rag_ok = (pile < 2) if not BUB else (pile < 3)
+                rmax_u = np.maximum.accumulate(np.where(x >= g, ds, 0.0))
+                ceil_ok = rmax_u <= (1.65 * d0_u + 2.3 * (d0_u ** 0.5) + 1.8)
+                cs_dex = np.concatenate([[0.0], np.cumsum(dex)])
+                w200_hi = np.minimum(ln + 1, x + 100)
+                w200_lo = np.maximum(0, x - 100)
+                d200 = (cs_dex[w200_hi] - cs_dex[w200_lo]) / np.maximum(1.0, (w200_hi - w200_lo).astype(np.float64))
+                rmax200_u = np.maximum.accumulate(np.where(x >= g, d200, 0.0))
+                ceil200_ok = rmax200_u <= (1.50 * d0_u + 2.0 * (d0_u ** 0.5) + 1.5)
+                fork_x = fk_lims[ci]
+                floor_ok = True if not BUB else (dp >= np.maximum(1.0, dp[g] - 3.0 * np.sqrt(np.maximum(dp[g], 1.0)) - 1.5))
+                ev_raw = (A[A_RAGR] + A[A_RAGL] + A[A_ENTER] + A[A_LEAVE]).astype(np.int32)
+                cs_ev = np.concatenate([[0], np.cumsum(ev_raw)])
+                near_ev = (cs_ev[np.minimum(ln + 1, x + 76)] - cs_ev[np.maximum(0, x - 75)]) >= 2
+                ev_bridge_ok = (~near_ev) | (pspan_deep >= 1) | (tg >= 2)
+                u_carry = ((x >= g) & (x < first_ent) & (x < first_lev) & (x < fork_x) & (FaF <= 0.0) & (Lseen <= 0.0)
+                           & cov_u & ~thin & ~hole & rag_ok & ceil_ok & ceil200_ok & floor_ok & ev_bridge_ok & ((pspan >= 1) | (tg >= 2)))
+                okU = u_carry & ((pspan >= UMIN_PSPAN) | (tg >= 2))
+                if UNECK > 0 and okU[g]:
+                    bad_u = np.nonzero(~okU[g:])[0]
+                    vu = int(bad_u[0]) if len(bad_u) else ln - g
+                    while vu < ln - g:
+                        a_ = g + vu
+                        if not u_carry[a_]:
+                            break
+                        lim_u = min(ln, a_ + UNECK)
+                        nc_ = np.nonzero(~u_carry[a_:lim_u + 1])[0]
+                        end_u = a_ + int(nc_[0]) if len(nc_) else lim_u + 1
+                        found_u = -1
+                        for b_ in range(a_ + 1, end_u):
+                            sust_e = min(ln + 1, b_ + USUST)
+                            if okU[b_] and (sust_e - b_ >= min(USUST, max(40, ln + 1 - b_))) and okU[b_:sust_e].all():
+                                found_u = b_
+                                break
+                        if found_u < 0:
+                            break
+                        okU[a_:found_u] = True
+                        bad_u2 = np.nonzero(~okU[found_u:])[0]
+                        vu = (found_u + int(bad_u2[0]) - g) if len(bad_u2) else ln - g
+        ok = okF | okG | okJ | okB | okU
         if broken <= ln:
             ok &= x < broken
         bad = np.nonzero(~ok[g:])[0]
@@ -713,7 +931,7 @@ def _verify(loaded, read_len, detail, patches, inside, only):
         # somewhere along ten kilobases must not count.
         nbridge = 0
         if BRIDGE and V < ln - g:
-            okd = okF | okG | okB
+            okd = okF | okG | okB | okU
             bb_ = base.copy()
             if broken <= ln:
                 okd &= x < broken
@@ -770,5 +988,5 @@ def _verify(loaded, read_len, detail, patches, inside, only):
             for xx in range(g, min(ln, g + 3000), 25):
                 sys.stderr.write("  %5d depth %4.0f supply %5.1f low %4.0f join %5d tau %4d tg %3d budget %5.1f (start %.0f)  %s\n" % (
                     xx - g, ds[xx], Fa[xx], clow[xx], pstar[xx] - g if pstar[xx] >= 0 else -1, tau[xx], tg[xx], O[xx], c0,
-                    " ".join(k for k, v in (("F", okF), ("G", okG), ("J", okJ), ("B", okB)) if v[xx])))
+                    " ".join(k for k, v in (("F", okF), ("G", okG), ("J", okJ), ("B", okB), ("U", okU)) if v[xx])))
     return out

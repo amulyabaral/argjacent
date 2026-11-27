@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0 (2026-11-27)
+
+Low-coverage sensitivity upgrades (`2.5x-10x`) across the minimizer scout (`aw`), exact read extender (`awx`), and flank verifier (`verify.py`), while preserving `< 0.5%` primary certified chimera rates and multi-copy repeat-wall abstention.
+
+New
+- **Two-stage saturating Bloom pre-pass & denser `-k 21 -w 11` CLI default (`src/aw.c`, `argjacent/cli.py`):** `pass0` records `>= 2x` minimizer sightings before freeing `bloom1` prior to `pass1`, eliminating first-read link loss on `2x` anchors without increasing peak graph RAM; gene-seed minimizers are pre-inserted into `bloom` before `pass0`, optional `-H <hops>` recruits singleton frontier anchors at non-capped dead ends, and the Python CLI defaults to `-k 21 -w 11` (`1.75x` denser anchors with zero `1x` error-node pollution).
+- **Dead-end paired-end `FR` mate bridges & adapter-hub guards (`src/aw.c`):** records `FR` mate-pair links (`-i 420` default) flagged with bit 14 (`Edge.mate`) and traverses them strictly at within-read dead ends (`tot == 0`) so exact within-read Dijkstra coordinates remain untouched; `is_chimeric_hub` (`deg_sv >= 24` with `max_count <= 3` or `max_count * 16 < tot_sv`) and the dead-end mate-hub guard (`deg_m >= 16` with `max_m <= 3` or `max_m * 8 < tot`) block adapter/poly-tail fan-ins and 3' adapter mate explosions without clipping plasmid or multi-copy IS backbones.
+- **Multi-tier `FR` mate, sub-`21bp` mate-stepping bridge, `1-bp` backward `K=31`, & `K2 = 16` tip rescue (`src/awx.c`):** when exact extension stalls (`tot3 < 1`, `-R 3` default), rescues (1) concordant `FR` mates (`ov >= 10 bp`), (2) **sub-`21bp` mate-stepping bridges (`ov_s = 6..30 bp`)** where an intermediate read bridges `s`'s tip (`>= 6` exact high-Q bases) and overlaps a placed upstream read's downstream mate by `>= 35 bp` (`<= 1` mismatch via `K=31` `ix`), (3) phase-complete `1-bp`-step backward `K=31` probes (`back = 1..48`, requiring `>= 2` unanimous reads for tip mismatches), and (4) `0`-mismatch `K2 = 16` read-tip overlaps (`SAMP = 4`), plus low-depth isolated-error active-read retention (`chk_iso`) and junk/adapter tail filtering (`has_junk_tail`).
+- **Rule U mate-bridged low-coverage certification & short-repeat/fork guards (`argjacent/verify.py`):** certifies low-depth (`d0_u <= 20x`) single-context positions `x >= g` backed by `>= 1` concordant spanning pair (`UMARG = 20`, `U_TG_MIN = 1`) while enforcing zero non-allele entering reads, zero non-patch leaving reads, same-side candidate divergence truncation (`_cand_fork_limits`), event-gated deep-gene anchoring (`st <= g - 175` when `gene_in_ev >= 1`), asymmetric upstream pair bridging (`pspan_deep`) near raw event pairs (`>= 2` within `±75 bp`), and 41-bp + 200-bp moving-average depth ceilings.
+
+Fixed
+- **Terminal gene-end paralog hijack guard (`argjacent/pipeline.py`, `argjacent/cli.py`):** rejects `redo = 300` sample-end replacements when mismatches crowd near the gene boundary (`> 15` in the terminal 100 bp or `> 9` in the terminal 30 bp), preventing C/N-terminal paralog or co-occurring allele hijacks while retaining uniform `~90%`-identity orthologs.
+
 ## 0.5.1 (2026-11-25)
 
 Cohort scaling optimizations (PR #1) and targeted bug fixes from the 25-sample expanded validation and second-round code audit.
