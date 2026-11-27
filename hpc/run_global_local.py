@@ -297,10 +297,10 @@ def process_staged(staged, out_dir, kma_db, kma_ref_fa, shared_genes, args, env)
                 download_file(staged["r1_url"], r1, env)
                 download_file(staged["r2_url"], r2, env)
 
-        # 1. Optional fastp trimming (and immediate deletion of raw FASTQs)
+        # 1. Optional fastp trimming (plain .fq avoids 4-5x redundant gzip/gunzip CPU across fastp -> kma -> aw; deleted right after argjacent)
         if not args.skip_fastp and shutil.which("fastp", path=env["PATH"]):
-            tr1 = os.path.join(s_tmp, f"{sid}_trim_1.fq.gz")
-            tr2 = os.path.join(s_tmp, f"{sid}_trim_2.fq.gz")
+            tr1 = os.path.join(s_tmp, f"{sid}_trim_1.fq")
+            tr2 = os.path.join(s_tmp, f"{sid}_trim_2.fq")
             subprocess.run(
                 [
                     "fastp", "-i", r1, "-I", r2, "-o", tr1, "-O", tr2,
