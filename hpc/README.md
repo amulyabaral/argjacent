@@ -160,3 +160,52 @@ OUT_DIR/
 ```
 
 > **Note on `cohort.cohort_repeats.tsv` (Part B):** Cohort two-sided pairing (`cohort_pairs.tsv`, Part A) achieved **0% added chimeras** across all multi-sample benchmarks (CAMI II Strain Madness, CAMI III Human Gut, and real infant gut HiFi cohorts). Post-repeat exit jumping (`cohort_repeats.tsv`, Part B) is accurate for isolated repeats (e.g., single `IS26`) but should be treated as **exploratory** in dense clinical communities with chained mobile elements.
+
+---
+
+## 8. Global Metagenome Benchmark vs. Pre-Made ENA/MGnify & Logan Assemblies
+
+To run **ARGjacent** at scale against curated public global metagenomes *without* storing multi-TB FASTQ archives—and automatically compare against matched pre-made **ENA/MGnify (`ERZ`, metaSPAdes/MEGAHIT)** or **Logan S3** assemblies:
+
+```bash
+# 0. One-time database setup on HPC (UniVec, ResFinder + KMA index, PlasmidFinder, ISfinder, optional geNomad)
+bash hpc/setup_annotation_dbs.sh --db-dir /scratch/$USER/argj_dbs --with-genomad
+
+# 1. Build a curated, biome-stratified manifest for a target year (runs on login node in ~20-40 s)
+python3 hpc/fetch_global_manifest.py \
+  --year 2023 \
+  --biomes human_gut,wastewater,livestock,soil_plant,aquatic \
+  --min-gbp 3.0 --max-gbp 25.0 \
+  --per-biome 200 --max-per-study 50 --min-study-samples 4 \
+  --check-assembler --check-logan \
+  -o global_2023.tsv
+
+# 2. Preview & run a 1-sample pilot first
+bash hpc/submit_global_benchmark.sh \
+  --manifest global_2023.tsv \
+  --kma-db /scratch/$USER/argj_dbs/resfinder/resfinder_kma \
+  --kma-ref-fa /scratch/$USER/argj_dbs/resfinder/resfinder.fa \
+  --db-env /scratch/$USER/argj_dbs/db_paths.env \
+  --out /scratch/$USER/argj_global_2023 \
+  --partition YOUR_PARTITION --account YOUR_ACCOUNT \
+  --limit 1 --dry-run
+
+# 3. Launch full ephemeral-scratch array + auto-chained cohort, comparison, and 5-layer annotation
+bash hpc/submit_global_benchmark.sh \
+  --manifest global_2023.tsv \
+  --kma-db /scratch/$USER/argj_dbs/resfinder/resfinder_kma \
+  --kma-ref-fa /scratch/$USER/argj_dbs/resfinder/resfinder.fa \
+  --db-env /scratch/$USER/argj_dbs/db_paths.env \
+  --out /scratch/$USER/argj_global_2023 \
+  --partition YOUR_PARTITION --account YOUR_ACCOUNT \
+  --cpus 8 --mem 24G --time 02:00:00 --max-concurrent 15
+```
+
+Each Slurm task stages paired FASTQs onto `$SLURM_TMPDIR`, runs `fastp → kma → argjacent`, immediately deletes FASTQs, fetches the matched pre-made `ERZ` (or `--use-logan`) assembly, extracts ±10 kb flanks around the exact same detected ARGs (`hpc/extract_assembly_flanks.py`), deletes the full assembly, and writes only compact outputs. After the array finishes:
+1. `hpc/run_global_post.sbatch` runs per-BioProject `argjacent-cohort`, merges `summary/run_metrics.tsv`, and generates biome-stratified comparison tables (`comparison/global_cmp_summary.tsv`, `comparison/global_cmp_per_side.tsv`) plus matched certified/assembly FASTAs (`comparison/global_cmp_argjacent_certified.fa` and `comparison/global_cmp_assembly_flanks.fa`).
+2. `hpc/run_annotate.sbatch` (auto-chained via `--db-env`, or runnable standalone) runs `hpc/annotate_flanks.py` identically on both FASTAs across all enabled layers: (1) UniVec reagent/cloning-vector screen (`reagent_vector_audit.tsv`), (2) ISfinder + co-localized ResFinder ARGs + Pyrodigal/mobileOG-db ORFs with exact distance to the focal ARG edge, (3) geNomad + PlasmidFinder replicon calls, (4) MGE-masked host taxonomy (Kraken2/MMseqs2), and (5) cross-biome HGT clustering (`*_hgt_clusters.tsv`, excluding reagent vectors), producing `annotation/annotation_comparison_summary.tsv` and `annotation/annotation_comparison_per_side.tsv`.
+
+You can verify the entire global fetch-run-compare-annotate workflow offline locally in ~10 seconds with:
+```bash
+bash hpc/test_global_local.sh
+```
