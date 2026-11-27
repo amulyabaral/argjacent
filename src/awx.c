@@ -41,14 +41,12 @@
 #include <pthread.h>
 #define AWX_VERSION "0.6.0"
 #define K 31
-#define K2 19
 #define PB2 20
-#define SAMP 8
 #define QMIN 15
 #define REDO 0              /* the gene part is the seed as given; reads are laid on it with differences tolerated */
 #define MAXQ 512
 #define LA 60
-static int PATCH = 1, RESCUE = 1;
+static int K2 = 16, SAMP = 4, PATCH = 1, RESCUE = 3;
 #ifndef ALTMAX
 #define ALTMAX 64
 #endif
@@ -210,7 +208,8 @@ static int has_junk_tail(uint32_t r, int sd, int off0) {
 static int rescue_stall(St *s) {
     if (s->len < K) return 0;
     int added = 0;
-    /* 1. Mate-anchored FR short-overlap / 1-mismatch rescue */
+    int min_mate_ov = RESCUE >= 2 ? 10 : 14;
+    /* 1. Mate-anchored FR short-overlap / 1-2 mismatch rescue */
     for (uint32_t h = 0; h <= s->pmask; h++) {
         if (!s->pm[h].k) continue;
         uint32_t r = (s->pm[h].k >> 1) - 1;
@@ -225,12 +224,13 @@ static int rescue_stall(St *s) {
         int max_ov = L - 10;
         if (max_ov > 150) max_ov = 150;
         if (max_ov > s->len) max_ov = s->len;
-        for (int ov = max_ov; ov >= 14; ov--) {
+        for (int ov = max_ov; ov >= min_mate_ov; ov--) {
             int d = s->len - ov;
             if (d <= d_r || d - d_r > 1200) continue;
             uint8_t bn = rb(m, sd_m, ov);
             if ((bn & 8) || (bn & 7) > 3) continue;
-            int max_mm = ov >= 45 ? 2 : (ov >= 24 ? 1 : 0);
+            int max_mm = RESCUE >= 2 ? (ov >= 40 ? 2 : (ov >= 20 ? 1 : 0)) : (ov >= 45 ? 2 : (ov >= 24 ? 1 : 0));
+            int tip_req = (RESCUE >= 2 && ov < 24) ? 6 : 8;
             int mm = 0, okb = 0, tip_bad = 0;
             for (int i = ov - 1; i >= 0; i--) {
                 uint8_t b = rb(m, sd_m, i);
@@ -239,13 +239,13 @@ static int rescue_stall(St *s) {
                 if ((b & 7) != s->P[p]) {
                     if (p < EX0) { mm++; }
                     else {
-                        if (ov - 1 - i < 8) { tip_bad = 1; break; }
+                        if (ov - 1 - i < tip_req) { tip_bad = 1; break; }
                         if (++mm > max_mm) break;
                     }
                 } else okb++;
             }
             work += (uint64_t)(ov / 2 + 4);
-            if (!tip_bad && mm <= max_mm && okb >= 14 && !has_junk_tail(m, sd_m, ov)) {
+            if (!tip_bad && mm <= max_mm && okb >= min_mate_ov && !has_junk_tail(m, sd_m, ov)) {
                 act_add(s, m, sd_m, d, 0);
                 added++;
                 break;
@@ -253,10 +253,185 @@ static int rescue_stall(St *s) {
         }
     }
     if (added > 0) return 1;
-    /* 2. Unambiguous K2=19 read-tip index rescue (19..43 bp exact overlap, single consensus forward extension) */
+    /* 1c. RESCUE>=3: Mate-stepping bridge closure across 6..30 bp overlaps!
+       Uses an upstream read r (sd_r=0) on s whose unplaced downstream mate m (sd_m=1) overlaps an intermediate
+       read r_br by >=35 bp (via K=31 index ix), while r_br bridges back onto s's tip by >=6 exact high-Q bases. */
+    if (RESCUE >= 3) {
+        for (uint32_t h = 0; h <= s->pmask && !added; h++) {
+            if (!s->pm[h].k) continue;
+            uint32_t r = (s->pm[h].k >> 1) - 1;
+            int sd_r = (int)(s->pm[h].k & 1);
+            int32_t d_r = s->pm[h].d;
+            if (sd_r != 0 || d_r < s->len - 700 || d_r >= s->len) continue;
+            uint32_t m = r ^ 1;
+            if (m >= nr || rd[m].len < 60) continue;
+            int sd_m = 1, L_m = rd[m].len;
+            const PE *em = pm_find(s, m);
+            if (em && (int)(em->k & 1) == sd_m && em->d + L_m > s->len) continue;
+            if (has_junk_tail(m, sd_m, 0)) continue;
+            for (int o_m = 0; o_m <= 24 && o_m + K <= L_m && !added; o_m += 12) {
+                uint64_t km = 0, rc = 0; int bad = 0;
+                for (int i = 0; i < K; i++) {
+                    uint8_t b = rb(m, sd_m, o_m + i) & 7;
+                    if (b > 3) { bad = 1; break; }
+                    km = (km << 2) | b;
+                    rc = (rc >> 2) | ((uint64_t)(3 - b) << (2 * (K - 1)));
+                }
+                if (bad) continue;
+                for (int sd_br = 0; sd_br < 2 && !added; sd_br++) {
+                    uint64_t qk = sd_br ? rc : km;
+                    long p = find(qk);
+                    if (p < 0) continue;
+                    if ((size_t)p + 32 < nix && ix[p + 32].km == qk) continue;
+                    for (size_t j = (size_t)p; j < nix && ix[j].km == qk && !added; j++) {
+                        uint32_t r_br = ix[j].r;
+                        if (r_br == m || r_br == r) continue;
+                        int L_br = rd[r_br].len;
+                        int o_br = sd_br ? L_br - K - ix[j].o : ix[j].o;
+                        int delta = o_br - o_m;     /* r_br starts `delta` bp upstream of m */
+                        if (delta < 6 || delta > L_br - 35) continue;
+                        /* verify r_br <-> m overlap (>=35 bp, <=1 mismatch) */
+                        int ov_m0 = delta, ov_m1 = L_br < delta + L_m ? L_br : delta + L_m;
+                        if (ov_m1 - ov_m0 < 35) continue;
+                        int mm_m = 0, ok_m = 0;
+                        for (int i = ov_m0; i < ov_m1; i++) {
+                            uint8_t b1 = rb(r_br, sd_br, i), b2 = rb(m, sd_m, i - delta);
+                            if ((b1 & 8) || (b2 & 8) || (b1 & 7) > 3 || (b2 & 7) > 3) continue;
+                            if ((b1 & 7) != (b2 & 7)) { if (++mm_m > 1) break; } else ok_m++;
+                        }
+                        work += 24;
+                        if (mm_m > 1 || ok_m < 33) continue;
+                        /* test exact high-Q overlap ov_s in [6..30] between r_br prefix and tip of s */
+                        int max_ovs = s->len < 30 ? s->len : 30;
+                        if (max_ovs > delta + 14) max_ovs = delta + 14;
+                        if (max_ovs > L_br - 20) max_ovs = L_br - 20;
+                        for (int ov_s = max_ovs; ov_s >= 6; ov_s--) {
+                            int d_br = s->len - ov_s, d_m = d_br + delta;
+                            if (d_m <= d_r || (d_m + L_m) - d_r > 780) continue;
+                            uint8_t bn = rb(r_br, sd_br, ov_s);
+                            if ((bn & 8) || (bn & 7) > 3) continue;
+                            int exact_s = 1;
+                            for (int i = 0; i < ov_s; i++) {
+                                uint8_t bs = rb(r_br, sd_br, i);
+                                if ((bs & 8) || (bs & 7) != s->P[d_br + i]) { exact_s = 0; break; }
+                            }
+                            if (exact_s && !has_junk_tail(r_br, sd_br, ov_s)) {
+                                act_add(s, r_br, sd_br, d_br, 0);
+                                act_add(s, m, sd_m, d_m, 0);
+                                added = 2;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (added > 0) return 1;
+    }
+    /* 1b. RESCUE>=2: Phase-complete (1-bp step) backward K=31 probe across isolated read/tip sequencing errors */
+    if (RESCUE >= 2 && s->len >= K + 8) {
+        uint32_t br[64]; int bsd[64], bd[64], bmm_p[64]; uint8_t bmm_b[64]; int nb = 0;
+        for (int back = 1; back <= 48; back++) {
+            int p0 = s->len - K - back;
+            if (p0 < 0) break;
+            uint64_t km = 0, rc = 0; int bad = 0;
+            for (int i = 0; i < K; i++) {
+                uint8_t b = s->P[p0 + i];
+                if (b > 3) { bad = 1; break; }
+                km = (km << 2) | b;
+                rc = (rc >> 2) | ((uint64_t)(3 - b) << (2 * (K - 1)));
+            }
+            if (bad) continue;
+            for (int o2 = 0; o2 < 2; o2++) {
+                uint64_t qk = o2 ? rc : km;
+                long p = find(qk);
+                if (p < 0) continue;
+                if ((size_t)p + 48 < nix && ix[p + 48].km == qk) continue;
+                for (size_t j = (size_t)p; j < nix && ix[j].km == qk; j++) {
+                    uint32_t r = ix[j].r; int L = rd[r].len;
+                    int o = o2 ? L - K - ix[j].o : ix[j].o;
+                    int d = p0 - o, ov = s->len - d;
+                    if (ov < 35 || d + L < s->len + 10) continue;
+                    const PE *e = pm_find(s, r);
+                    if (e && (int)(e->k & 1) == o2 && e->d == d) continue;
+                    int dup = 0;
+                    for (int k = 0; k < nb; k++) if (br[k] == r && bsd[k] == o2 && bd[k] == d) { dup = 1; break; }
+                    if (dup) continue;
+                    uint8_t bn = rb(r, o2, ov);
+                    if ((bn & 8) || (bn & 7) > 3) continue;
+                    int i0 = d < 0 ? -d : 0, max_mm = (ov - i0) >= 75 ? 2 : 1;
+                    int mm = 0, okb = 0, prev_mm = -100, last_mm = -1, bad_mm = 0; uint8_t fix_b = 4;
+                    for (int i = i0; i < ov; i++) {
+                        uint8_t b = rb(r, o2, i);
+                        int pos = d + i;
+                        if ((b & 8) || (b & 7) > 3) continue;
+                        if ((b & 7) != s->P[pos]) {
+                            if (pos < EX0) continue;
+                            if (QTOL && s->V[pos]) continue;
+                            if (pos - prev_mm < 20 || ++mm > max_mm) { bad_mm = 1; break; }
+                            prev_mm = last_mm = pos; fix_b = b & 7;
+                        } else okb++;
+                    }
+                    work += 28;
+                    if (bad_mm || okb < 33) continue;
+                    if (last_mm >= s->len - 8 && !(s->nthin > 0 && mm == 1 && last_mm >= s->len - 16)) continue;
+                    if (!has_junk_tail(r, o2, ov) && nb < 64) {
+                        br[nb] = r; bsd[nb] = o2; bd[nb] = d; bmm_p[nb] = mm == 1 ? last_mm : -1; bmm_b[nb] = fix_b; nb++;
+                    }
+                }
+            }
+        }
+        /* Filter tip mismatches (last_mm >= s->len - 8): require >= 2 unanimous reads to prevent 1-read paralog jumps! */
+        if (nb > 0) {
+            int has_tip_mm = 0;
+            for (int c = 0; c < nb; c++) if (bmm_p[c] >= s->len - 8) has_tip_mm = 1;
+            if (has_tip_mm) {
+                int w_nb = 0;
+                for (int c = 0; c < nb; c++) {
+                    if (bmm_p[c] >= s->len - 8) {
+                        int same_fix = 0;
+                        for (int c2 = 0; c2 < nb; c2++) if (bmm_p[c2] == bmm_p[c] && bmm_b[c2] == bmm_b[c]) same_fix++;
+                        if (same_fix < 2) continue;
+                    }
+                    br[w_nb] = br[c]; bsd[w_nb] = bsd[c]; bd[w_nb] = bd[c]; bmm_p[w_nb] = bmm_p[c]; bmm_b[w_nb] = bmm_b[c]; w_nb++;
+                }
+                nb = w_nb;
+            }
+        }
+        if (nb > 0) {
+            int ok_cons = 1;
+            for (int k = 0; k < 12; k++) {
+                int vc[4] = {0, 0, 0, 0};
+                for (int c = 0; c < nb; c++) {
+                    int idx_ = s->len + k - bd[c];
+                    if (idx_ >= 0 && idx_ < rd[br[c]].len) {
+                        uint8_t b = rb(br[c], bsd[c], idx_);
+                        if (!(b & 8) && (b & 7) < 4) vc[b & 7]++;
+                    }
+                }
+                int totv = vc[0] + vc[1] + vc[2] + vc[3], top = 0;
+                for (int b = 0; b < 4; b++) if (vc[b] > top) top = vc[b];
+                if (totv >= 2 && (totv <= 3 ? (top < totv) : (top * 100 < 85 * totv))) { ok_cons = 0; break; }
+            }
+            if (ok_cons) {
+                if (nb >= 2 && bmm_p[0] >= EX0 && bmm_p[0] >= s->len - 20) {
+                    int all_same = 1;
+                    for (int c = 1; c < nb; c++) if (bmm_p[c] != bmm_p[0] || bmm_b[c] != bmm_b[0]) { all_same = 0; break; }
+                    if (all_same && bmm_b[0] < 4) s->P[bmm_p[0]] = bmm_b[0];
+                }
+                for (int c = 0; c < nb; c++) {
+                    if (bmm_p[c] >= EX0 && bmm_p[c] < s->capP && !s->V[bmm_p[c]]) s->V[bmm_p[c]] = 1;
+                    act_add(s, br[c], bsd[c], bd[c], 0);
+                }
+                return 1;
+            }
+        }
+    }
+    /* 2. Unambiguous K2 read-tip index rescue (strict 0-mismatch over flank overlap!) */
     if (!ix2 || s->len < K2 + 3) return 0;
     uint32_t cr[64]; int csd[64], cd[64], nc = 0;
-    for (int sh = 0; sh < 4; sh++) {
+    int sh_lim = RESCUE >= 2 ? 2 : 4, max_k2_ov = RESCUE >= 2 ? 55 : 43, max_bkt = RESCUE >= 2 ? 24 : 32;
+    for (int sh = 0; sh < sh_lim; sh++) {
         int p0 = s->len - K2 - sh;
         if (p0 < 0) break;
         uint64_t km = 0, rc = 0; int bad = 0;
@@ -271,12 +446,12 @@ static int rescue_stall(St *s) {
             uint64_t qk = o2 ? rc : km;
             long p = find2(qk);
             if (p < 0) continue;
-            if ((size_t)p + 32 < nix2 && ix2[p + 32].km == qk) continue;     /* skip hot/repetitive 19-mers */
+            if ((size_t)p + (size_t)max_bkt < nix2 && ix2[p + max_bkt].km == qk) continue;
             for (size_t j = (size_t)p; j < nix2 && ix2[j].km == qk; j++) {
                 uint32_t r = ix2[j].r; int L = rd[r].len;
                 int o = o2 ? L - K2 - ix2[j].o : ix2[j].o;
                 int d = p0 - o, ov = s->len - d;
-                if (ov < K2 || ov > 43 || d < 0 || d + L < s->len + 15) continue;
+                if (ov < K2 || ov > max_k2_ov || d < 0 || d + L < s->len + 12) continue;
                 const PE *e = pm_find(s, r);
                 if (e && (int)(e->k & 1) == o2 && e->d == d) continue;
                 int dup = 0;
@@ -288,7 +463,7 @@ static int rescue_stall(St *s) {
                 for (int i = 0; i < ov; i++) {
                     uint8_t b = rb(r, o2, i);
                     if ((b & 8) || (b & 7) > 3) continue;
-                    if ((b & 7) != s->P[d + i]) { if (d + i >= EX0) { mm = 99; break; } mm++; }
+                    if ((b & 7) != s->P[d + i]) { if (d + i >= EX0) { mm = 99; break; } }
                     else okb++;
                 }
                 work += 24;
@@ -299,7 +474,7 @@ static int rescue_stall(St *s) {
         }
     }
     if (nc == 0) return 0;
-    for (int k = 0; k < 10; k++) {
+    for (int k = 0; k < 12; k++) {
         int vc[4] = {0, 0, 0, 0};
         for (int c = 0; c < nc; c++) {
             int idx_ = s->len + k - cd[c];
@@ -310,7 +485,8 @@ static int rescue_stall(St *s) {
         }
         int totv = vc[0] + vc[1] + vc[2] + vc[3], top = 0;
         for (int b = 0; b < 4; b++) if (vc[b] > top) top = vc[b];
-        if (totv >= 2 && (totv - top >= 2 || top * 100 < 80 * totv)) return 0;   /* ambiguous 19-bp fork: abstain */
+        if (totv >= 2 && (RESCUE >= 2 ? (totv <= 3 ? top < totv : top * 100 < 85 * totv)
+                                      : (totv - top >= 2 || top * 100 < 80 * totv))) return 0;
     }
     for (int c = 0; c < nc; c++) act_add(s, cr[c], csd[c], cd[c], 0);
     return 1;
@@ -435,7 +611,25 @@ static void extend(St *s, St **q, int *nq, int maxq) {
             }
             if (nstruct) s->mass = mass0 * (double)n[choose] / (double)armtot;
         } else if (anyvar) s->nvar++;
-        /* take the base: reads that say otherwise are off the path */
+        /* take the base: reads that say otherwise are off the path (unless verified as isolated low-cov read error) */
+        uint8_t c_maj[13];
+        int chk_iso = (RESCUE >= 2 && !split && tot3 >= 1 && tot3 <= 8);
+        if (chk_iso) {
+            for (int k = 1; k <= 12; k++) {
+                int vc[4] = {0, 0, 0, 0};
+                for (int a = 0; a < s->na; a++) {
+                    Act A = s->act[a]; int i = s->len - A.d;
+                    if (i < 0 || A.skip > s->len || i + k >= rd[A.r].len) continue;
+                    uint8_t b0 = rb(A.r, A.s, i);
+                    if (!(b0 & 8) && (b0 & 7) == choose) {
+                        uint8_t bk = rb(A.r, A.s, i + k);
+                        if (!(bk & 8) && (bk & 7) < 4) vc[bk & 7]++;
+                    }
+                }
+                int m = 0; for (int b = 1; b < 4; b++) if (vc[b] > vc[m]) m = b;
+                c_maj[k] = vc[m] >= 1 ? (uint8_t)m : 9;
+            }
+        }
         w = 0;
         for (int a = 0; a < s->na; a++) {
             Act A = s->act[a]; if (s->len - A.d < 0 || A.skip > s->len) { s->act[w++] = A; continue; }
@@ -445,6 +639,13 @@ static void extend(St *s, St **q, int *nq, int maxq) {
                 int sh = vsh[x & 7]; A.nt++;
                 if (vty[x & 7] == 2 || sh) { A.d += sh; A.skip = s->len + 1 + (vty[x & 7] == 2 ? 30 : 0) + (sh > 0 ? sh : 0); pm_set(s, A.r, A.s, A.d); }
                 s->act[w++] = A;
+            } else if (chk_iso && A.nt < 2 && s->len - A.d + 12 < rd[A.r].len) {
+                int i = s->len - A.d, cmpn = 0, same = 0;
+                for (int k = 1; k <= 12 && i + k < rd[A.r].len; k++) {
+                    uint8_t bk = rb(A.r, A.s, i + k);
+                    if (!(bk & 8) && (bk & 7) < 4 && c_maj[k] < 4) { cmpn++; same += ((bk & 7) == c_maj[k]); }
+                }
+                if (cmpn >= 10 && same == cmpn && !has_junk_tail(A.r, A.s, i)) { A.nt++; s->act[w++] = A; }
             }
         }
         s->na = w;
@@ -543,14 +744,30 @@ static void *sort_worker(void *arg) {
     return NULL;
 }
 int main(int argc, char **argv) {
-    int c, nt = 1; const char *rspec = "0";
-    while ((c = getopt(argc, argv, "c:D:r:m:t:vP:Q:R:")) != -1) {
-        if (c == 'c') maxc = atoi(optarg); else if (c == 'P') PATCH = atoi(optarg); else if (c == 'Q') QTOL = atoi(optarg); else if (c == 'R') RESCUE = atoi(optarg); else if (c == 'D') flank_target = atoi(optarg); else if (c == 'r') rspec = optarg;
+    int c, nt = 1, k2_set = 0, samp_set = 0; const char *rspec = "0";
+    while ((c = getopt(argc, argv, "c:D:r:m:t:vP:Q:R:S:K:")) != -1) {
+        if (c == 'c') maxc = atoi(optarg); else if (c == 'P') PATCH = atoi(optarg); else if (c == 'Q') QTOL = atoi(optarg); else if (c == 'R') RESCUE = atoi(optarg);
+        else if (c == 'S') { SAMP = atoi(optarg); samp_set = 1; }
+        else if (c == 'K') { K2 = atoi(optarg); k2_set = 1; }
+        else if (c == 'D') flank_target = atoi(optarg); else if (c == 'r') rspec = optarg;
         else if (c == 't') nt = atoi(optarg);
         else if (c == 'm') minmass = atof(optarg);          /* arms that carry a smaller share of the gene's reads are not extended */
         else if (c == 'v') { printf("awx %s\n", AWX_VERSION); return 0; }
         else { argc = 0; break; }
     }
+    if (RESCUE == 1) {
+        if (!k2_set) K2 = 19;
+        if (!samp_set) SAMP = 8;
+    } else if (RESCUE == 2) {
+        if (!k2_set) K2 = 17;
+        if (!samp_set) SAMP = 4;
+    } else if (RESCUE >= 3) {
+        if (!k2_set) K2 = 16;
+        if (!samp_set) SAMP = 4;
+    }
+    if (K2 < 14) K2 = 14;
+    if (K2 > 24) K2 = 24;
+    if (SAMP != 1 && SAMP != 2 && SAMP != 4 && SAMP != 8) SAMP = 8;
     if (argc - optind != 3 || maxc < 1 || flank_target < 30) {
         fprintf(stderr, "awx %s\nusage: awx [-c 16] [-D 10000] [-r 0,300] [-t 1] [-P 1] [-Q 4] seeds.fa out_prefix reads.tsv   (reads.tsv: - for standard input; -P 0 -Q 0: the proposer of 0.3.0)\n", AWX_VERSION);
         return 1;
@@ -618,6 +835,7 @@ int main(int argc, char **argv) {
         pt2 = calloc(((size_t)1 << PB2) + 2, 4);
         if (!pt2) { fprintf(stderr, "awx: out of memory while building tip index\n"); return 2; }
         const uint64_t kmask2 = (1ULL << (2 * K2)) - 1;
+        const int tip_lim = RESCUE >= 2 ? 36 : 24, tip_mask = RESCUE >= 2 ? 1 : 3;
         for (int go = 0; go < 2; go++) {
             for (uint32_t r = 0; r < nr; r++) {
                 int L = rd[r].len; if (L < K2) continue;
@@ -628,8 +846,8 @@ int main(int argc, char **argv) {
                     if (b > 3) { valid = 0; km = 0; } else { km = ((km << 2) | b) & kmask2; valid++; }
                     int o = p - (K2 - 1);
                     if (o >= 0 && valid >= K2) {
-                        int tip_f = (o <= 24 && (o & 3) == 0);
-                        int tip_r = (L - K2 - o <= 24 && ((L - K2 - o) & 3) == 0);
+                        int tip_f = (o <= tip_lim && (o & tip_mask) == 0);
+                        int tip_r = (L - K2 - o <= tip_lim && ((L - K2 - o) & tip_mask) == 0);
                         if (tip_f || tip_r) {
                             if (go) ix2[pt2[(km >> (2 * K2 - PB2)) + 1]++] = (Ent){ km, r, (uint16_t)o };
                             else { pt2[(km >> (2 * K2 - PB2)) + 2]++; nix2++; }

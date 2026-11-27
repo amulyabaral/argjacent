@@ -168,3 +168,55 @@ def test_deterministic_mate_and_short_overlap_rescue(cli, tmp_path):
     paths = json.load(open(out + ".flanks.json"))["genes"]["g"]["right"]["paths"]
     assert paths and paths[0]["context_len"] >= 1000, paths
     assert paths[0]["flank"][: paths[0]["context_len"]] == right_fl[: paths[0]["context_len"]]
+
+
+def test_mate_stepping_bridge_closure_sub21bp_overlap(cli, tmp_path):
+    """Constructs a 3.5x-4x tiling with a forced 10-bp read overlap (< k=21, unbridgeable by k=21
+    de Bruijn assemblers) spanned by an upstream FR pair (r, m) where an intermediate read r_br
+    overlaps s's tip by 10 bp and overlaps downstream mate m by >= 60 bp: ARGjacent must assemble
+    and certify cleanly across the 10-bp overlap.
+    """
+    rng = random.Random(608)
+    gene = _rand_seq(rng, 800)
+    left_fl = _rand_seq(rng, 2500)
+    right_fl = _rand_seq(rng, 2500)
+    mol = left_fl + gene + right_fl
+    g_start = len(left_fl)
+    g_end = g_start + len(gene)
+
+    genes_fa = str(tmp_path / "g.fa")
+    open(genes_fa, "w").write(">g\n%s\n" % gene)
+
+    rlen = 150
+    q = "I" * rlen
+    j_lo, j_hi = g_end + 340, g_end + 350   # exact 10-bp overlap neck!
+    pairs = []
+    # Dense tiling everywhere EXCEPT no read starts or ends across [j_lo, j_hi] with >10 bp overlap
+    for st in range(g_start - 1800, g_end + 1800, 38):
+        ins = 380
+        r1_s, r1_e = st, st + rlen
+        r2_s, r2_e = st + ins - rlen, st + ins
+        if (r1_s < j_lo and r1_e > j_lo) or (r2_s < j_hi and r2_e > j_hi):
+            continue
+        pairs.append((st, st + ins))
+
+    # Pair 1: upstream mate r ends right at j_hi (g_end + 350), downstream mate m sits at [g_end + 410, g_end + 560)
+    for sh in (-2, 0):
+        pairs.append((j_hi - rlen + sh, g_end + 560 + sh))
+    # Bridge Pair 2: intermediate read r_br starts at j_lo (g_end + 340 -> 10 bp overlap with j_hi!)
+    # and runs to g_end + 490 (80 bp exact overlap with m at [410..490)!), with its mate downstream at [570..720)
+    pairs.append((j_lo, g_end + 720))
+    pairs.append((j_lo, g_end + 730))
+
+    r1, r2 = str(tmp_path / "r1.fq"), str(tmp_path / "r2.fq")
+    with open(r1, "w") as f1, open(r2, "w") as f2:
+        for i, (a, b) in enumerate(pairs):
+            frag = mol[a:b]
+            f1.write("@p%d/1\n%s\n+\n%s\n" % (i, frag[:rlen], q))
+            f2.write("@p%d/2\n%s\n+\n%s\n" % (i, _rc(frag)[:rlen], q))
+
+    out = str(tmp_path / "res10")
+    cli(["-g", genes_fa, "-1", r1, "-2", r2, "-o", out, "-t", "2", "-D", "1500"])
+    paths = json.load(open(out + ".flanks.json"))["genes"]["g"]["right"]["paths"]
+    assert paths and paths[0]["context_len"] >= 1000, paths
+    assert paths[0]["flank"][: paths[0]["context_len"]] == right_fl[: paths[0]["context_len"]]

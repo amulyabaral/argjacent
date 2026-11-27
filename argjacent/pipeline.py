@@ -15,6 +15,7 @@ Inside the temporary folder a gene is known by its number in the gene file, so t
 name or a field separator.
 """
 import os
+import shlex
 import subprocess
 
 COMP = str.maketrans("ACGTN", "TGCAN")
@@ -40,7 +41,8 @@ def write_seeds(genes, present, path):
 
 def propose(awx, seeds, prefix, reads, max_cands, flank, threads, log, stdin=None):
     """run awx; writes PREFIX.r0.fa, PREFIX.r0.tsv, PREFIX.r300.fa, PREFIX.r300.tsv -> exit status"""
-    cmd = [awx, "-c", str(max_cands), "-D", str(flank), "-r", "0,%d" % REDO, "-t", str(threads), seeds, prefix, reads]
+    extra = shlex.split(os.environ["ARGJ_AWX_EXTRA"]) if os.environ.get("ARGJ_AWX_EXTRA") else []
+    cmd = [awx, "-c", str(max_cands), "-D", str(flank), "-r", "0,%d" % REDO, "-t", str(threads)] + extra + [seeds, prefix, reads]
     log.write("command: %s\n" % " ".join(cmd))
     log.flush()
     return subprocess.call(cmd, stderr=log, stdin=stdin)
@@ -100,6 +102,20 @@ def merge(genes, prefix, cdir):
             if keep:
                 st["sides_sample_end"] += 1
                 st["dropped_too_far"] += len(rs) - len(keep)
+                if os.environ.get("ARGJ_KEEP_PLAIN") == "1":
+                    ps_side = [c for c in p if c[0] == side]
+                    if ps_side:
+                        max_k = max(len(c[3]) - c[2] for c, _, _, _, _ in keep)
+                        max_p = max(len(c[3]) - c[2] for c in ps_side)
+                        low_d = any(1 <= d <= 5 for _, d, _, _, _ in keep)
+                        if max_p > max_k + 80 or low_d:
+                            seen_s = [c[3] for c, _, _, _, _ in keep]
+                            for pc in ps_side:
+                                if not any(s0.startswith(pc[3]) or pc[3].startswith(s0) for s0 in seen_s):
+                                    keep.append((pc, _end_diffs(seq_i, side, pc[2], pc[3]),
+                                                 _end_diffs(seq_i, side, pc[2], pc[3], NEAR),
+                                                 _end_diffs(seq_i, side, pc[2], pc[3], TIP), "database"))
+                                    seen_s.append(pc[3])
             else:
                 keep = [(c, _end_diffs(seq_i, side, c[2], c[3]),
                          _end_diffs(seq_i, side, c[2], c[3], NEAR),

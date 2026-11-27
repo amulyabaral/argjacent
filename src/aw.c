@@ -55,7 +55,7 @@
 #define SLACK 800
 #define MAXA 8192
 
-static int K = 31, W = 20, D = 10000, MINEDGE = 1, use_bloom = 1, MATE_INS = 380;
+static int K = 31, W = 20, D = 10000, MINEDGE = 1, use_bloom = 1, MATE_INS = 420, FRONTIER_HOPS = 0;
 static uint32_t MAXBALL = 2000000;
 static int NTHREADS = 1;
 static int LOWC = 1;                               /* 0 (-L): keep low-complexity k-mers as anchors, as before 0.2.0 */
@@ -807,10 +807,11 @@ static int map_node(uint64_t h, NodeRef *r) {
     return 1;
 }
 static int is_chimeric_hub(uint64_t h, uint8_t sv) {
-    /* 1 if side `sv` of anchor h fans out into >= 24 within-read links yet none has count > 3
-       (signature of a sequencing adapter / poly-tail junction entered from random genomic cut points,
-       never a high-depth plasmid or multi-copy IS element which has a strong backbone edge on `sv`). */
-    uint32_t deg_sv = 0, max_c = 0;
+    /* 1 if side `sv` of anchor h fans out into >= 24 within-read links where no single link has
+       both > 3 reads and >= 1/16 of the side's total reads (signature of a sequencing adapter /
+       poly-tail junction entered from random genomic cut points, never a plasmid or multi-copy IS
+       element with a strong backbone edge on `sv`). */
+    uint32_t deg_sv = 0, max_c = 0; uint64_t tot_sv = 0;
     if (mm_base) {
         uint32_t p; uint64_t b; const Lm *lm = lm_block(h, &p, &b);
         if (!lm) return 0;
@@ -822,21 +823,21 @@ static int is_chimeric_hub(uint64_t h, uint8_t sv) {
         if (eo > d->n_edges || nd[l].deg > d->n_edges - eo) return 0;
         const EdgeD *es = (const EdgeD *)(mm_base + d->off_edges) + eo;
         for (uint32_t i = 0; i < nd[l].deg; i++) if (!es[i].mate && es[i].su == sv) {
-            deg_sv++; if (es[i].count > max_c) max_c = es[i].count;
-            if (max_c > 3) return 0;
+            deg_sv++; tot_sv += es[i].count;
+            if (es[i].count > max_c) max_c = es[i].count;
         }
-        return deg_sv >= 24;
+        return deg_sv >= 24 && (max_c <= 3 || (uint64_t)max_c * 16 < tot_sv);
     }
     uint32_t u = node_find(h);
     if (u == NONE || !(NODE(u).head & HUB_BIT)) return 0;
     for (uint32_t e = HEAD(u); e != ENONE; e = EDGE(e).next & ENONE) {
         const Edge *E = &EDGE(e);
         if (!((E->dist >> 14) & 1) && (E->dist >> 15) == sv) {
-            deg_sv++; if (E->count > max_c) max_c = E->count;
-            if (max_c > 3) return 0;
+            deg_sv++; tot_sv += E->count;
+            if (E->count > max_c) max_c = E->count;
         }
     }
-    return deg_sv >= 24;
+    return deg_sv >= 24 && (max_c <= 3 || (uint64_t)max_c * 16 < tot_sv);
 }
 static inline void map_hint(uint64_t h) {
     if (!mm_hint) return;
@@ -912,6 +913,8 @@ static uint32_t ws_get(uint64_t h) {                /* the anchor's record, made
 }
 /* the anchors reached by any walk: pass 2 keeps the read pairs that hold one of them */
 static uint64_t *bset; static uint64_t bset_mask = 0, n_reached = 0;
+static uint64_t *fset; static uint64_t fset_mask = 0, n_fset = 0;
+static int walk_quiet = 0;
 static inline int bset_has(uint64_t h) {
     uint64_t s = (h >> 7) & bset_mask;
     while (bset[s]) { if (bset[s] == h) return 1; s = (s + 1) & bset_mask; }
@@ -929,34 +932,71 @@ static void bset_add(uint64_t h) {
         free(o);
     }
 }
+static void fset_clear(void) {
+    if (fset) memset(fset, 0, (fset_mask + 1) * 8);
+    n_fset = 0;
+}
+static inline int fset_has(uint64_t h) {
+    if (!n_fset) return 0;
+    uint64_t s = (h >> 7) & fset_mask;
+    while (fset[s]) { if (fset[s] == h) return 1; s = (s + 1) & fset_mask; }
+    return 0;
+}
+static void fset_add(uint64_t h) {
+    if (!h) return;
+    if (!fset) { fset_mask = 4095; fset = xcalloc(fset_mask + 1, 8); }
+    uint64_t s = (h >> 7) & fset_mask;
+    while (fset[s]) { if (fset[s] == h) return; s = (s + 1) & fset_mask; }
+    fset[s] = h; n_fset++;
+    if (n_fset * 4 > fset_mask + 1) {
+        uint64_t *o = fset, om = fset_mask;
+        fset_mask = (fset_mask + 1) * 2 - 1; fset = xcalloc(fset_mask + 1, 8);
+        for (uint64_t i = 0; i <= om; i++) if (o[i]) { uint64_t t = (o[i] >> 7) & fset_mask; while (fset[t]) t = (t + 1) & fset_mask; fset[t] = o[i]; }
+        free(o);
+    }
+}
 
 /* pass the share m of anchor ui on to its outward neighbours, in proportion to the read counts of the links */
 static void pass_on(uint32_t ui, float m, int dir, int32_t lo, int32_t hi) {
     NodeRef nr; if (!map_node(ws[ui].h, &nr)) return;
     const int32_t cu = ws[ui].coord; const uint8_t out = ((dir > 0) == (ws[ui].rev == 0)) ? 1 : 0;
-    double tot = 0; uint8_t want_mate = 0;
+    double raw_tot = 0, tot = 0; uint8_t want_mate = 0;
     for (uint32_t x = 0; x < nr.deg; x++) {
         const EdgeD *E = &nr.e[x];
         if (E->mate || E->su != out || E->count < MINEDGE) continue;
         int32_t cv = cu + dir * E->dist;
         if (cv > hi || cv < lo) continue;
-        tot += E->count;
+        raw_tot += E->count;
+    }
+    if (raw_tot > 0) {
+        for (uint32_t x = 0; x < nr.deg; x++) {
+            const EdgeD *E = &nr.e[x];
+            if (E->mate || E->su != out || E->count < MINEDGE) continue;
+            int32_t cv = cu + dir * E->dist;
+            if (cv > hi || cv < lo) continue;
+            if (EPS > 0 && (E->count <= 2 || (double)E->count * 2.0 <= raw_tot) && is_chimeric_hub(E->to, E->sv)) continue;
+            tot += E->count;
+        }
     }
     if (tot <= 0) {
         want_mate = 1;
+        uint32_t deg_m = 0, max_m = 0;
         for (uint32_t x = 0; x < nr.deg; x++) {
             const EdgeD *E = &nr.e[x];
             if (!E->mate || E->su != out || E->count < MINEDGE) continue;
             int32_t cv = cu + dir * E->dist;
             if (cv > hi || cv < lo) continue;
-            tot += E->count;
+            tot += E->count; deg_m++;
+            if (E->count > max_m) max_m = E->count;
         }
+        if (EPS > 0 && deg_m >= 16 && (max_m <= 3 || (double)max_m * 8.0 < tot)) tot = 0;
+        raw_tot = tot;
     }
     if (tot <= 0) return;
     for (uint32_t x = 0; x < nr.deg; x++) {
         const EdgeD *E = &nr.e[x];
         if (E->mate != want_mate || E->su != out || E->count < MINEDGE) continue;
-        if (EPS > 0 && E->count == 1 && tot >= 8 && is_chimeric_hub(E->to, E->sv)) continue;
+        if (EPS > 0 && (E->count <= 2 || (double)E->count * 2.0 <= raw_tot) && is_chimeric_hub(E->to, E->sv)) continue;
         int32_t cv = cu + dir * E->dist;
         if (cv > hi || cv < lo) continue;
         float share = (float)(m * E->count / tot);
@@ -1028,6 +1068,16 @@ static WalkRes walk(const char *gname, int dir, Anc *ga, int gn, int glen) {
         ball[nball++] = u;
         { int32_t o = dir > 0 ? ws[u].coord - glen : -ws[u].coord; if (o > far) far = o; }
         pass_on(u, m, dir, lo, hi);
+    }
+    if (walk_quiet) {
+        if (!capped && far < D) {
+            if (far <= 150) for (int j = 0; j < gn; j++) fset_add(ga[j].h);
+            for (uint32_t i = 0; i < nball; i++) {
+                int32_t o = dir > 0 ? ws[ball[i]].coord - glen : -ws[ball[i]].coord;
+                if (o >= far - 500) fset_add(ws[ball[i]].h);
+            }
+        }
+        return (WalkRes){ seeds, capped, nball, far };
     }
     for (uint32_t i = 0; i < nball; i++) bset_add(ws[ball[i]].h);
     uint32_t nd = 0;
@@ -1143,18 +1193,76 @@ static FILE *f_genes;
 static void walk_gene(const char *name, const char *seq, int len, void *ctx) {
     (void)ctx; int m = gene_anchors(seq, len);
     WalkRes r = walk(name, +1, GA, m, len), l = walk(name, -1, GA, m, len);
-    fprintf(f_genes, "%s\t%d\t%d\t%d\t%u\t%u\t%d\t%d\t%d\n", name, len, m, r.seeds, r.reached, l.reached, r.far, l.far, r.capped + 2 * l.capped);
+    if (!walk_quiet)
+        fprintf(f_genes, "%s\t%d\t%d\t%d\t%u\t%u\t%d\t%d\t%d\n", name, len, m, r.seeds, r.reached, l.reached, r.far, l.far, r.capped + 2 * l.capped);
+}
+static void frontier_links_read(Anc *a, int n, uint32_t *id, uint8_t *was_solid) {
+    for (int j = 0; j < n; j++) {
+        was_solid[j] = (uint8_t)bloom_has(a[j].h);
+        id[j] = node_get(a[j].h);
+    }
+    for (int j = 1; j < n; j++) {
+        if (was_solid[j - 1] && was_solid[j]) continue;    /* already added in pass1 */
+        uint8_t sa = a[j - 1].st ? 0 : 1, sb = a[j].st ? 1 : 0;
+        uint32_t gap = a[j].pos - a[j - 1].pos;
+        if (gap <= 16000) {
+            edge_half(id[j - 1], a[j].h, sa, sb, (uint16_t)gap, 0);
+            if (a[j - 1].h != a[j].h || sa != sb) edge_half(id[j], a[j - 1].h, sb, sa, (uint16_t)gap, 0);
+        }
+    }
+}
+static void apply_frontier(Batch *b) {
+    static uint32_t id1[MAXA], id2[MAXA];
+    static uint8_t ws1[MAXA], ws2[MAXA];
+    const Anc *A = b->anc;
+    for (int p = 0; p < b->n; p++) {
+        uint32_t lo = b->aoff[2 * p], mid = b->aoff[2 * p + 1], hi = b->aoff[2 * p + 2];
+        int m1 = (int)(mid - lo), m2 = (int)(hi - mid), hit = 0;
+        for (int i = 0; i < m1 && !hit; i++) hit = fset_has(A[lo + i].h);
+        for (int j = 0; j < m2 && !hit; j++) hit = fset_has(A[mid + j].h);
+        if (!hit) continue;
+        Anc *a1 = (Anc *)(A + lo), *a2 = (Anc *)(A + mid);
+        frontier_links_read(a1, m1, id1, ws1);
+        frontier_links_read(a2, m2, id2, ws2);
+        if (MATE_INS > K && m1 > 0 && m2 > 0) {
+            int p1 = m1 - 1, p2 = m2 - 1;
+            if (!(ws1[p1] && ws2[p2]) && a1[p1].pos < (uint32_t)MATE_INS && a2[p2].pos < (uint32_t)MATE_INS) {
+                int shared = 0;
+                for (int i = 0; i < m1 && !shared; i++)
+                    for (int j = 0; j < m2; j++)
+                        if (a1[i].h == a2[j].h) { shared = 1; break; }
+                if (!shared) {
+                    uint8_t s1 = a1[p1].st ? 0 : 1, s2 = a2[p2].st ? 0 : 1;
+                    int g = (MATE_INS - K) - (int)a1[p1].pos - (int)a2[p2].pos;
+                    if (g < 80) g = 80;
+                    if (g <= 16000) {
+                        edge_half(id1[p1], a2[p2].h, s1, s2, (uint16_t)g, 1);
+                        if (a1[p1].h != a2[p2].h || s1 != s2) edge_half(id2[p2], a1[p1].h, s2, s1, (uint16_t)g, 1);
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < m1; i++) if (!ws1[i]) bloom_set_on(bloom, a1[i].h);
+        for (int j = 0; j < m2; j++) if (!ws2[j]) bloom_set_on(bloom, a2[j].h);
+    }
+}
+static void pass_frontier(const char *fn1, const char *fn2) {
+    LR r1, r2; lr_open(&r1, fn1); lr_open(&r2, fn2);
+    int warned = 1; quiet_eof = 1;
+    run_batches(&r1, &r2, &warned, batch_anchors, apply_frontier);
+    lr_close(&r1); lr_close(&r2);
 }
 
 int main(int argc, char **argv) {
     const char *genes = NULL, *out = "aw_out", *dump = NULL, *map_out = NULL, *map_in = NULL; int bloom_log2 = 28, c;
     uint32_t force_parts = 0; double mem_mb = 0;
-    while ((c = getopt(argc, argv, "k:w:D:b:e:Bg:o:A:vp:M:S:G:ft:Lm:P:i:")) != -1) {
+    while ((c = getopt(argc, argv, "k:w:D:b:e:Bg:o:A:vp:M:S:G:ft:Lm:P:i:H:")) != -1) {
         if (c == 'v') { printf("aw %s (anchor walk)\n", AW_VERSION); return 0; }
         if (c == 'f') write_fq = 1;
         if (c == 't') NTHREADS = atoi(optarg);
         if (c == 'L') LOWC = 0;
         if (c == 'i') MATE_INS = atoi(optarg);
+        if (c == 'H') FRONTIER_HOPS = atoi(optarg);
         if (c == 'p') EPS = atof(optarg);
         if (c == 'M') MAXBALL = (uint32_t)atol(optarg);
         if (c == 'S') map_out = optarg;
@@ -1263,6 +1371,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "aw: warning: Bloom filter too small for this sample: about %.0f%% of one-off anchors were kept as if seen twice.\n"
                         "    This costs memory and time. Next time use -b %d (%.0f MB).\n", 100 * bfp, b_suggest,
                 (double)(1ULL << b_suggest) / 8 / 1048576);
+    }
+    if (FRONTIER_HOPS > 0 && use_bloom && !mm_base) {
+        for (int hop = 0; hop < FRONTIER_HOPS; hop++) {
+            fset_clear();
+            walk_quiet = 1;
+            each_fasta(genes, walk_gene, NULL);
+            walk_quiet = 0;
+            if (!n_fset) break;
+            pass_frontier(argv[optind], argv[optind + 1]);
+            passes1++;
+            tot_nodes = n_nodes; tot_edges = n_edges;
+        }
+        free(fset); fset = NULL; fset_mask = n_fset = 0;
     }
     big_free(bloom, (bloom_mask + 1) * 8); bloom = NULL;
 
