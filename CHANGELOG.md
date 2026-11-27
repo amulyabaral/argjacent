@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0 (2026-11-27)
+
+Low-coverage sensitivity upgrades (`2.5x-10x`) across the minimizer scout (`aw`), exact read extender (`awx`), and flank verifier (`verify.py`), while preserving `< 0.5%` primary certified chimera rates and multi-copy repeat-wall abstention.
+
+New
+- **Two-stage saturating Bloom pre-pass (`src/aw.c`):** `pass0` records `>= 2x` minimizer sightings before freeing `bloom1` prior to `pass1`, eliminating first-read link loss on `2x` anchors without increasing peak graph RAM; gene-seed minimizers are pre-inserted into `bloom` before `pass0`.
+- **Dead-end paired-end `FR` mate bridges & adapter-hub guard (`src/aw.c`):** records `FR` mate-pair links (`-i 380` default) flagged with bit 14 (`Edge.mate`) and traverses them strictly at within-read dead ends (`tot == 0`) so exact within-read Dijkstra coordinates remain untouched; `is_chimeric_hub` (`deg_sv >= 24 && max_count <= 3` on entry side `sv`) blocks random-offset adapter fan-ins without clipping high-depth plasmid or multi-copy IS backbones.
+- **Stall-only `FR` mate & `K2 = 19` read-tip rescue (`src/awx.c`):** when exact extension stalls (`tot3 < 1`, `-R 1` default), rescues concordant `FR` mates (`ov = 14..150 bp`, mismatch-tiered with exact terminal 8 bp) and `19..43 bp` exact overlaps from a compact `K2 = 19` read-tip index (`<= 32` bucket hits, `>= 80%` forward 10-bp consensus), plus isolated low-Q (`Q < 15`) pass-through and homopolymer/dinucleotide/Illumina adapter tail filtering (`has_junk_tail`).
+- **Rule U low-coverage mate-bridged certification (`argjacent/verify.py`):** certifies low-depth (`d0_u <= 20x`) single-context positions `x >= g` backed by `>= 2` concordant spanning read pairs (`UMARG = 25`, bridging `<= 90 bp` 1-pair Poisson necks when `pspan >= 2` sustains for `>= 180 bp` beyond) while enforcing **zero** non-allele entering reads, **zero** non-patch leaving reads, `FaF == 0`, `Lseen == 0`, no multi-copy depth jump, and no ragged-end pileup.
+
+Fixed
+- **Terminal gene-end paralog hijack guard (`argjacent/pipeline.py`, `argjacent/cli.py`):** rejects `redo = 300` sample-end replacements when mismatches crowd near the gene boundary (`> 15` in the terminal 100 bp or `> 9` in the terminal 30 bp), preventing C/N-terminal paralog or co-occurring allele hijacks while retaining uniform `~90%`-identity orthologs.
+
 ## 0.5.1 (2026-11-25)
 
 Cohort scaling optimizations (PR #1) and targeted bug fixes from the 25-sample expanded validation and second-round code audit.

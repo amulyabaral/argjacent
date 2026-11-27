@@ -49,13 +49,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#define AW_VERSION "0.5.1"
+#define AW_VERSION "0.6.0"
 #define NONE 0xFFFFFFFFu
 #define ENONE 0x7FFFFFFFu                          /* end of a list of links (31 bits; the top bit of `next` is a side) */
 #define SLACK 800
 #define MAXA 8192
 
-static int K = 31, W = 20, D = 10000, MINEDGE = 1, use_bloom = 1;
+static int K = 31, W = 20, D = 10000, MINEDGE = 1, use_bloom = 1, MATE_INS = 380;
 static uint32_t MAXBALL = 2000000;
 static int NTHREADS = 1;
 static int LOWC = 1;                               /* 0 (-L): keep low-complexity k-mers as anchors, as before 0.2.0 */
@@ -82,7 +82,7 @@ static Edge *edgec[512]; static uint32_t n_edges = 0;
 typedef struct { uint32_t u1, e; } HubEnt;         /* 8 bytes: node + 1 (0 = empty), link index */
 static HubEnt *hub_ht = NULL; static uint64_t hub_cap = 0, hub_n = 0;
 static uint32_t *idx; static uint64_t idx_size = 0;
-static uint64_t *bloom; static uint64_t bloom_mask = 0;
+static uint64_t *bloom, *bloom1; static uint64_t bloom_mask = 0;
 static int8_t code[256];
 static uint32_t NPART = 1, PART = 0;               /* the map is built in NPART parts; this pass builds part PART */
 #define MINE(h) (NPART == 1 || (uint32_t)(((h) >> 40) % NPART) == PART)
@@ -155,10 +155,19 @@ static inline uint32_t node_get(uint64_t h) {
     if ((uint64_t)n_nodes * 10 > idx_size * 7) idx_rebuild(idx_size * 2);       /* the table of places is at most seven tenths full */
     return n_nodes - 1;
 }
-static inline int bloom_tas(uint64_t h) {
-    uint64_t *w = &bloom[(h >> 20) & bloom_mask];
+static inline int bloom_tas_on(uint64_t *bl, uint64_t h) {
+    uint64_t *w = &bl[(h >> 20) & bloom_mask];
     uint64_t bits = (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63)) | (1ULL << ((h >> 12) & 63));
     int seen = (*w & bits) == bits; *w |= bits; return seen;
+}
+static inline void bloom_set_on(uint64_t *bl, uint64_t h) {
+    uint64_t *w = &bl[(h >> 20) & bloom_mask];
+    *w |= (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63)) | (1ULL << ((h >> 12) & 63));
+}
+static inline int bloom_has(uint64_t h) {
+    const uint64_t *w = &bloom[(h >> 20) & bloom_mask];
+    uint64_t bits = (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63)) | (1ULL << ((h >> 12) & 63));
+    return (*w & bits) == bits;
 }
 static inline uint64_t hub_hash(uint32_t u, uint64_t to, uint16_t ds, uint8_t sv) {
     return mix64(to ^ ((uint64_t)u * 0x9e3779b97f4a7c15ULL) ^ ((uint64_t)ds << 1) ^ (uint64_t)sv);
@@ -184,11 +193,12 @@ static inline void hub_insert(uint32_t u, uint32_t e, uint64_t h) {
     hub_ht[s] = (HubEnt){ u + 1, e };
     hub_n++;
 }
-static inline void edge_half(uint32_t u, uint64_t to, uint8_t su, uint8_t sv, uint16_t d) {
+static inline void edge_half(uint32_t u, uint64_t to, uint8_t su, uint8_t sv, uint16_t d, uint8_t mate) {
     /* a link of anchor u to the anchor with hash `to`, d bp away; the same link seen again is counted.
+       Bit 14 of `dist` marks a paired-end mate bridge (used by the walk only at dead ends without within-read links).
        Anchors with more than HUB_DEG links (e.g. chimeric poly-G/adapter junction k-mers) are indexed in hub_ht so
        high-degree hubs stay O(1) while keeping the exact same linked list on NODE(u). */
-    const uint16_t ds = (uint16_t)(d | ((uint16_t)su << 15));
+    const uint16_t ds = (uint16_t)((d & 0x3FFFu) | ((uint16_t)mate << 14) | ((uint16_t)su << 15));
     uint64_t hh = 0;
     if (__builtin_expect((NODE(u).head & HUB_BIT) != 0, 0)) {
         hh = hub_hash(u, to, ds, sv);
@@ -396,12 +406,12 @@ static void links_from(Anc *a, int n, uint32_t *id, uint8_t *solid) {
        so that each part sees exactly the links a map built in one piece has. */
     if (PART == 0) { st_reads++; st_anchors += (uint64_t)n; }
     for (int j = 0; j < n; j++) {
-        if (use_bloom) __builtin_prefetch(&bloom[(a[j].h >> 20) & bloom_mask], 1);
+        if (use_bloom) __builtin_prefetch(&bloom[(a[j].h >> 20) & bloom_mask], 0);
         if (MINE(a[j].h)) __builtin_prefetch(&idx[a[j].h & (idx_size - 1)]);
     }
     for (int j = 0; j < n; j++) {
         id[j] = NONE;
-        if (!use_bloom || bloom_tas(a[j].h)) {
+        if (!use_bloom || bloom_has(a[j].h)) {
             solid[j] = 1;
             if (PART == 0) st_solid++;
             if (MINE(a[j].h)) id[j] = node_get(a[j].h);
@@ -413,18 +423,40 @@ static void links_from(Anc *a, int n, uint32_t *id, uint8_t *solid) {
         if (p >= 0) {
             uint8_t sa = a[p].st ? 0 : 1, sb = a[j].st ? 1 : 0;   /* side: 1 = after the canonical k-mer, 0 = before it */
             uint32_t gap = a[j].pos - a[p].pos;
-            if (gap <= 32000) {                                    /* distances are stored in 15 bits */
-                if (id[p] != NONE) edge_half(id[p], a[j].h, sa, sb, (uint16_t)gap);
-                if (id[j] != NONE && (a[p].h != a[j].h || sa != sb)) edge_half(id[j], a[p].h, sb, sa, (uint16_t)gap);
+            if (gap <= 16000) {                                    /* distances are stored in 14 bits */
+                if (id[p] != NONE) edge_half(id[p], a[j].h, sa, sb, (uint16_t)gap, 0);
+                if (id[j] != NONE && (a[p].h != a[j].h || sa != sb)) edge_half(id[j], a[p].h, sb, sa, (uint16_t)gap, 0);
             }
         }
         p = j;
     }
 }
 static void pair_links(Anc *a1, int m1, Anc *a2, int m2) {
-    /* one read pair into the map */
-    static uint32_t id[MAXA]; static uint8_t solid[MAXA];
-    links_from(a1, m1, id, solid); links_from(a2, m2, id, solid);
+    /* one read pair into the map: exact within-read neighbour links, plus a paired-end FR bridge between disjoint mates */
+    static uint32_t id1[MAXA], id2[MAXA];
+    static uint8_t solid1[MAXA], solid2[MAXA];
+    links_from(a1, m1, id1, solid1);
+    links_from(a2, m2, id2, solid2);
+    if (MATE_INS > K && m1 > 0 && m2 > 0) {
+        int p1 = -1, p2 = -1;
+        for (int i = m1 - 1; i >= 0; i--) if (solid1[i]) { p1 = i; break; }
+        for (int j = m2 - 1; j >= 0; j--) if (solid2[j]) { p2 = j; break; }
+        if (p1 >= 0 && p2 >= 0 && a1[p1].pos < (uint32_t)MATE_INS && a2[p2].pos < (uint32_t)MATE_INS) {
+            int shared = 0;
+            for (int i = 0; i < m1 && !shared; i++)
+                for (int j = 0; j < m2; j++)
+                    if (a1[i].h == a2[j].h) { shared = 1; break; }
+            if (!shared) {
+                uint8_t s1 = a1[p1].st ? 0 : 1, s2 = a2[p2].st ? 0 : 1;
+                int g = (MATE_INS - K) - (int)a1[p1].pos - (int)a2[p2].pos;
+                if (g < 80) g = 80;
+                if (g <= 16000) {
+                    if (id1[p1] != NONE) edge_half(id1[p1], a2[p2].h, s1, s2, (uint16_t)g, 1);
+                    if (id2[p2] != NONE && (a1[p1].h != a2[p2].h || s1 != s2)) edge_half(id2[p2], a1[p1].h, s2, s1, (uint16_t)g, 1);
+                }
+            }
+        }
+    }
 }
 
 /* ---------- batches of read pairs ----------
@@ -583,10 +615,26 @@ static void apply_links(Batch *b) {
         if (mb > MEM_BUDGET) p1_over = 1;
     }
 }
+static void apply_bloom(Batch *b) {
+    const Anc *A = b->anc; const uint32_t tot = b->aoff[2 * b->n];
+    for (uint32_t c = 0; c < tot; c++) {
+        if (c + 64 < tot) {
+            __builtin_prefetch(&bloom1[(A[c + 64].h >> 20) & bloom_mask], 1);
+            __builtin_prefetch(&bloom[(A[c + 64].h >> 20) & bloom_mask], 1);
+        }
+        if (bloom_tas_on(bloom1, A[c].h)) bloom_set_on(bloom, A[c].h);
+    }
+}
+static void pass0(const char *fn1, const char *fn2) {
+    LR r1, r2; lr_open(&r1, fn1); lr_open(&r2, fn2);
+    int warned = 0; quiet_eof = 0; p1_over = 0;
+    run_batches(&r1, &r2, &warned, batch_anchors, apply_bloom);
+    lr_close(&r1); lr_close(&r2);
+}
 static void pass1(const char *fn1, const char *fn2) {
     LR r1, r2; lr_open(&r1, fn1); lr_open(&r2, fn2);
-    int warned = PART > 0;                           /* the first part has given the warnings about the files */
-    quiet_eof = PART > 0;
+    int warned = use_bloom || PART > 0;              /* pass 0 (or the first part) has given the warnings about the files */
+    quiet_eof = use_bloom || PART > 0;
     p1_r1 = &r1; p1_half = 0;
     run_batches(&r1, &r2, &warned, batch_anchors, apply_links);
     if (p1_over) p1_frac = p1_now();
@@ -599,7 +647,7 @@ static void pass1(const char *fn1, const char *fn2) {
    the links of all its anchors (those of one anchor next to each other, in the order the walk goes through them),
    the anchors sorted by hash, and a table with the first anchor of every LMSTEP-th and the place of its first link. */
 typedef struct { uint64_t h; uint32_t deg; uint32_t pad; } NodeD;
-typedef struct { uint64_t to; uint16_t dist; uint16_t count; uint8_t su, sv, pad[2]; } EdgeD;
+typedef struct { uint64_t to; uint16_t dist; uint16_t count; uint8_t su, sv, mate, pad; } EdgeD;
 typedef struct { uint64_t h; uint64_t eoff; } Lm;
 #define LMSTEP 512
 typedef struct { uint64_t n_nodes, n_edges, n_lm, off_edges, off_nodes, off_lm; } PartDir;
@@ -649,8 +697,8 @@ static void map_part_save(uint32_t p) {
             for (uint32_t e = HEAD(i); e != ENONE; e = EDGE(e).next & ENONE) {
                 if (nb == BUF) { if (fwrite(buf, sizeof(EdgeD), nb, mapf) != nb) map_wfail(); nb = 0; }
                 const Edge *E = &EDGE(e); EdgeD *o = &buf[nb++];
-                o->to = E->to; o->dist = E->dist & 0x7FFF; o->count = E->count;
-                o->su = (uint8_t)(E->dist >> 15); o->sv = (uint8_t)(E->next >> 31); o->pad[0] = o->pad[1] = 0;
+                o->to = E->to; o->dist = E->dist & 0x3FFF; o->count = E->count;
+                o->mate = (uint8_t)((E->dist >> 14) & 1); o->su = (uint8_t)(E->dist >> 15); o->sv = (uint8_t)(E->next >> 31); o->pad = 0;
                 deg++;
             }
             NODE(i).head = deg; ne += deg;
@@ -752,10 +800,43 @@ static int map_node(uint64_t h, NodeRef *r) {
     for (uint32_t e = HEAD(u); e != ENONE; e = EDGE(e).next & ENONE) {
         if (n == ebuf_cap) { ebuf_cap = ebuf_cap ? ebuf_cap * 2 : 1024; ebuf = xrealloc(ebuf, (size_t)ebuf_cap * sizeof(EdgeD)); }
         const Edge *E = &EDGE(e); EdgeD *o = &ebuf[n++];
-        o->to = E->to; o->dist = E->dist & 0x7FFF; o->count = E->count; o->su = (uint8_t)(E->dist >> 15); o->sv = (uint8_t)(E->next >> 31);
+        o->to = E->to; o->dist = E->dist & 0x3FFF; o->count = E->count;
+        o->mate = (uint8_t)((E->dist >> 14) & 1); o->su = (uint8_t)(E->dist >> 15); o->sv = (uint8_t)(E->next >> 31); o->pad = 0;
     }
     r->deg = n; r->e = ebuf;
     return 1;
+}
+static int is_chimeric_hub(uint64_t h, uint8_t sv) {
+    /* 1 if side `sv` of anchor h fans out into >= 24 within-read links yet none has count > 3
+       (signature of a sequencing adapter / poly-tail junction entered from random genomic cut points,
+       never a high-depth plasmid or multi-copy IS element which has a strong backbone edge on `sv`). */
+    uint32_t deg_sv = 0, max_c = 0;
+    if (mm_base) {
+        uint32_t p; uint64_t b; const Lm *lm = lm_block(h, &p, &b);
+        if (!lm) return 0;
+        const PartDir *d = &mm_dir[p]; const NodeD *nd = (const NodeD *)(mm_base + d->off_nodes);
+        uint64_t a = b * LMSTEP, z = a + LMSTEP < d->n_nodes ? a + LMSTEP : d->n_nodes, l = a, u = z;
+        while (l < u) { uint64_t mid = (l + u) / 2; if (nd[mid].h < h) l = mid + 1; else u = mid; }
+        if (l >= z || nd[l].h != h || nd[l].deg < 24) return 0;
+        uint64_t eo = lm[b].eoff; for (uint64_t i = a; i < l; i++) eo += nd[i].deg;
+        if (eo > d->n_edges || nd[l].deg > d->n_edges - eo) return 0;
+        const EdgeD *es = (const EdgeD *)(mm_base + d->off_edges) + eo;
+        for (uint32_t i = 0; i < nd[l].deg; i++) if (!es[i].mate && es[i].su == sv) {
+            deg_sv++; if (es[i].count > max_c) max_c = es[i].count;
+            if (max_c > 3) return 0;
+        }
+        return deg_sv >= 24;
+    }
+    uint32_t u = node_find(h);
+    if (u == NONE || !(NODE(u).head & HUB_BIT)) return 0;
+    for (uint32_t e = HEAD(u); e != ENONE; e = EDGE(e).next & ENONE) {
+        const Edge *E = &EDGE(e);
+        if (!((E->dist >> 14) & 1) && (E->dist >> 15) == sv) {
+            deg_sv++; if (E->count > max_c) max_c = E->count;
+            if (max_c > 3) return 0;
+        }
+    }
+    return deg_sv >= 24;
 }
 static inline void map_hint(uint64_t h) {
     if (!mm_hint) return;
@@ -770,9 +851,9 @@ static inline void map_hint(uint64_t h) {
 }
 
 /* Bloom filter load: expected share of one-off anchors that slip through as if seen twice */
-static double bloom_false_rate(void) {
+static double bloom_false_rate(const uint64_t *bl) {
     double s = 0; uint64_t nw = bloom_mask + 1;
-    for (uint64_t i = 0; i < nw; i++) { double f = __builtin_popcountll(bloom[i]) / 64.0; s += f * f * f; }
+    for (uint64_t i = 0; i < nw; i++) { double f = __builtin_popcountll(bl[i]) / 64.0; s += f * f * f; }
     return s / (double)nw;
 }
 
@@ -853,18 +934,29 @@ static void bset_add(uint64_t h) {
 static void pass_on(uint32_t ui, float m, int dir, int32_t lo, int32_t hi) {
     NodeRef nr; if (!map_node(ws[ui].h, &nr)) return;
     const int32_t cu = ws[ui].coord; const uint8_t out = ((dir > 0) == (ws[ui].rev == 0)) ? 1 : 0;
-    double tot = 0;
+    double tot = 0; uint8_t want_mate = 0;
     for (uint32_t x = 0; x < nr.deg; x++) {
         const EdgeD *E = &nr.e[x];
-        if (E->su != out || E->count < MINEDGE) continue;
+        if (E->mate || E->su != out || E->count < MINEDGE) continue;
         int32_t cv = cu + dir * E->dist;
         if (cv > hi || cv < lo) continue;
         tot += E->count;
     }
+    if (tot <= 0) {
+        want_mate = 1;
+        for (uint32_t x = 0; x < nr.deg; x++) {
+            const EdgeD *E = &nr.e[x];
+            if (!E->mate || E->su != out || E->count < MINEDGE) continue;
+            int32_t cv = cu + dir * E->dist;
+            if (cv > hi || cv < lo) continue;
+            tot += E->count;
+        }
+    }
     if (tot <= 0) return;
     for (uint32_t x = 0; x < nr.deg; x++) {
         const EdgeD *E = &nr.e[x];
-        if (E->su != out || E->count < MINEDGE) continue;
+        if (E->mate != want_mate || E->su != out || E->count < MINEDGE) continue;
+        if (EPS > 0 && E->count == 1 && tot >= 8 && is_chimeric_hub(E->to, E->sv)) continue;
         int32_t cv = cu + dir * E->dist;
         if (cv > hi || cv < lo) continue;
         float share = (float)(m * E->count / tot);
@@ -1043,6 +1135,10 @@ static void dump_seq(const char *name, const char *seq, int len, void *ctx) {
     (void)ctx; int m = gene_anchors(seq, len);
     for (int j = 0; j < m; j++) printf("%s\t%u\t%016lx\t%d\n", name, GA[j].pos, (unsigned long)GA[j].h, GA[j].st);
 }
+static void seed_bloom_seq(const char *name, const char *seq, int len, void *ctx) {
+    (void)name; (void)ctx; int m = gene_anchors(seq, len);
+    for (int j = 0; j < m; j++) bloom_set_on(bloom, GA[j].h);
+}
 static FILE *f_genes;
 static void walk_gene(const char *name, const char *seq, int len, void *ctx) {
     (void)ctx; int m = gene_anchors(seq, len);
@@ -1053,11 +1149,12 @@ static void walk_gene(const char *name, const char *seq, int len, void *ctx) {
 int main(int argc, char **argv) {
     const char *genes = NULL, *out = "aw_out", *dump = NULL, *map_out = NULL, *map_in = NULL; int bloom_log2 = 28, c;
     uint32_t force_parts = 0; double mem_mb = 0;
-    while ((c = getopt(argc, argv, "k:w:D:b:e:Bg:o:A:vp:M:S:G:ft:Lm:P:")) != -1) {
+    while ((c = getopt(argc, argv, "k:w:D:b:e:Bg:o:A:vp:M:S:G:ft:Lm:P:i:")) != -1) {
         if (c == 'v') { printf("aw %s (anchor walk)\n", AW_VERSION); return 0; }
         if (c == 'f') write_fq = 1;
         if (c == 't') NTHREADS = atoi(optarg);
         if (c == 'L') LOWC = 0;
+        if (c == 'i') MATE_INS = atoi(optarg);
         if (c == 'p') EPS = atof(optarg);
         if (c == 'M') MAXBALL = (uint32_t)atol(optarg);
         if (c == 'S') map_out = optarg;
@@ -1104,6 +1201,13 @@ int main(int argc, char **argv) {
     uint32_t nparts = 1; int passes1 = 0;
     if (map_in) map_open(map_in, 0);
     else {
+        if (use_bloom) {
+            bloom1 = big_alloc((bloom_mask + 1) * 8);
+            each_fasta(genes, seed_bloom_seq, NULL);
+            pass0(argv[optind], argv[optind + 1]);
+            bfp = bloom_false_rate(bloom1);
+            big_free(bloom1, (bloom_mask + 1) * 8); bloom1 = NULL;
+        }
         nparts = force_parts ? force_parts : 1;
         for (;;) {
             const int to_file = nparts > 1 || map_out != NULL;
@@ -1112,10 +1216,8 @@ int main(int argc, char **argv) {
             NPART = nparts; p1_over = 0; tot_nodes = tot_edges = 0; st_reads = st_anchors = st_solid = 0;
             for (PART = 0; PART < nparts; PART++) {
                 map_free(); idx_rebuild(1 << 16);
-                if (use_bloom && passes1) memset(bloom, 0, (bloom_mask + 1) * 8);
                 pass1(argv[optind], argv[optind + 1]); passes1++;
                 if (p1_over) break;
-                if (PART == 0 && use_bloom) bfp = bloom_false_rate();
                 tot_nodes += n_nodes; tot_edges += n_edges;
                 if (nparts > 1) fprintf(stderr, "aw: part %u of %u of the map: %u anchors, %u links, %.0f MB\n", PART + 1, nparts, n_nodes, n_edges / 2, map_bytes() / 1048576.0);
                 if (to_file) { map_part_save(PART); map_free(); }

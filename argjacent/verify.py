@@ -9,11 +9,15 @@ position x of a candidate only on evidence that molecules which carry the gene r
   B   budget: the matching reads next to the gene, minus every read seen leaving the path since (charged in the measure
       in which the leaving reads' mates lie on the path towards the gene), still number 8 or more, and stand three
       standard deviations clear of the chance in what was charged (0.4)
-  F   flow: more matching reads cover x than all loci that came on can supply, allowing for chance in both numbers and
+   F   flow: more matching reads cover x than all loci that came on can supply, allowing for chance in both numbers and
       for the supply being known only to about a tenth. What came on is what the reads seen coming on stand for, and at
       least what the depth has risen above its lowest level since the gene (beyond chance): a locus that comes on softly
       is seen by few of its reads (0.4; the faults of 0.3.0 on block E). And it never finds more of the gene's own reads
       than the budget allows at most: what was next to the gene, minus the reads charged as leaving, plus all that came on
+  U   unbranched mate-bridged path (0.6): at low to moderate depth (<= UMAXD), where ZERO foreign reads have entered
+      since g - INSIDE (even singletons), ZERO reads have left since g (even singletons), depth never rises to a
+      multi-copy plateau, and >= 2 concordant paired-end fragments bridge [x - UMARG, x + UMARG] (bridging brief <= UNECK
+      single-pair Poisson necks when >= 2 pairs resume for >= USUST bp beyond)
 
 and in any case only where two reads carry the 31 bases that end at x, where reads carry the 61 bases that end at x if
 the depth on both sides says they should, and where the place is not one that reads do not cross (a hole in the
@@ -116,6 +120,11 @@ SDET = 0.5
 GAP, GAPQ = 0.2, 0.1      # a place reads do not cross: under GAP of the depth carry it, under GAPQ of the depth leave or come on
 CUT = 30                  # bases taken off the end of every verified part before it is called certain
 DEPTH_BIN = 100           # bin width (bp) for compact per-candidate flank depth profiles exported to flanks.json / GFA
+ULEV = True               # Rule U: unbranched zero-join mate-bridged certification for low-depth single-copy loci
+UMAXD = 20.0              # maximum starting depth for Rule U (above this, F and B already vouch with full power)
+UMARG = 25                # bases required inside both ends of a concordant pair to bridge position x
+UNECK = 90                # max 1-pair Poisson neck (bp) bridged when >= 2 pairs sustain for USUST bp beyond
+USUST = 180               # sustained >= 2-pair run (bp) required beyond a 1-pair neck
 
 
 def lcb(n):
@@ -219,6 +228,12 @@ def _verify(loaded, read_len, detail, patches, inside, only):
         t = tpl[cuts[ci]:cuts[ci + 1]] if ci + 1 < len(cuts) else tpl[:0]
         st, en = t[:, 1], t[:, 2]
         st_all, en_all = st, en
+        ispair = (en - st) > rl + 2
+        if len(st) >= 3:
+            w0, w1, w2 = en[2:] - st[2:], en[1:-1] - st[1:-1], en[:-2] - st[:-2]
+            m12 = ((st[2:] == st[:-2]) & (en[2:] == en[1:-1])) | ((st[2:] == st[1:-1]) & (en[2:] == en[:-2]))
+            ispair = ispair.copy()
+            ispair[2:] |= m12 & (w0 >= np.maximum(w1, w2))
         if len(st):
             # a pair whose unread middle holds a whole variable stretch (reads leave the path and reads come on again, each
             # cluster at least TFRAC of the depth) may belong to the other version of that stretch: it says nothing here
@@ -238,7 +253,7 @@ def _verify(loaded, read_len, detail, patches, inside, only):
                 pe = EP[np.minimum(j, len(EP) - 1)]
                 c2 = (j < len(EP)) & (pe < g1)
                 keep_t = ~(c1 & c2)
-                st, en = st[keep_t], en[keep_t]
+                st, en, ispair = st[keep_t], en[keep_t], ispair[keep_t]
 
         def thru(p, xs, dl=DELTA):                            # templates that begin before p - DELTA and cover xs
             ends = np.sort(en[st <= p - dl])
@@ -698,7 +713,75 @@ def _verify(loaded, read_len, detail, patches, inside, only):
                 # this; 12 against 9 at a 40 % swing). KNOWN WEAKNESS while this is off.
                 capF = capF - Z * UNEV * np.sqrt(Uq + np.maximum(0.0, np.maximum(Lcum, 0.0) - Lseen) ** 2)
             okF = okF & (np.minimum(own, capF) >= barF)
-        ok = okF | okG | okJ | okB
+        # ---- U: unbranched zero-join mate-bridged path for low-depth single-copy loci
+        okU = np.zeros(ln + 1, dtype=bool)
+        if ULEV and ln > g:
+            g_med = float(np.median(dex[max(0, g - 200):g])) if g > 0 else 0.0
+            d0_u = max(float(ds[g]), g_med, 2.0)
+            if d0_u <= UMAXD and int(tg[min(ln, g + 15)]) >= 2:
+                if len(e):
+                    keep_eu = ~((e[:, 1] < g - NEAR) & (egl == 1))
+                    if BUB:
+                        keep_eu &= ~(eamb & (np.searchsorted(ebub, e[:, 1] + 3, side="right")
+                                             > np.searchsorted(ebub, e[:, 1] - 3, side="left")))
+                    eu = e[keep_eu]
+                    first_ent = int(eu[0, 1]) if len(eu) else ln + 1
+                else:
+                    first_ent = ln + 1
+                if len(lv):
+                    if BUB:
+                        l2 = (lv[:, 4] // 1000) == 2
+                        has_lb = (np.searchsorted(lbub, lv[:, 3] + 3, side="right")
+                                  > np.searchsorted(lbub, lv[:, 3] - 3, side="left"))
+                        lvu = lv[~(l2 & has_lb)]
+                    else:
+                        lvu = lv
+                    first_lev = int(lvu[0, 3]) if len(lvu) else ln + 1
+                else:
+                    first_lev = ln + 1
+                pst, pen = st[ispair], en[ispair]
+                pspan = np.zeros(ln + 1, dtype=np.int32)
+                if len(pst):
+                    span_ok = (pen - pst) >= 2 * UMARG
+                    pst_, pen_ = pst[span_ok], pen[span_ok]
+                    if len(pst_):
+                        pa = np.where(pst_ <= 0, 0, pst_ + UMARG)
+                        pb = np.where(pen_ >= ln, ln + 1, pen_ - UMARG + 1)
+                        vp = pb > pa
+                        if vp.any():
+                            pdiff = (np.bincount(np.minimum(ln + 1, pa[vp]), minlength=ln + 2)
+                                     - np.bincount(np.minimum(ln + 1, pb[vp]), minlength=ln + 2))
+                            pspan = np.cumsum(pdiff)[:ln + 1]
+                cov_u = (A[A_PATH] >= 1) if BUB else (A[A_EXACT] >= 1)
+                rag_ok = (pile < 2) if not BUB else (pile < 3)
+                rmax_u = np.maximum.accumulate(np.where(x >= g, ds, 0.0))
+                ceil_ok = rmax_u <= (1.65 * d0_u + 2.5 * (d0_u ** 0.5) + 2.0)
+                floor_ok = True if not BUB else (dp >= np.maximum(1.0, dp[g] - 3.0 * np.sqrt(np.maximum(dp[g], 1.0)) - 1.5))
+                u_carry = ((x >= g) & (x < first_ent) & (x < first_lev) & (FaF <= 0.0) & (Lseen <= 0.0)
+                           & cov_u & ~thin & ~hole & rag_ok & ceil_ok & floor_ok & ((pspan >= 1) | (tg >= 2)))
+                okU = u_carry & ((pspan >= 2) | (tg >= 2))
+                if UNECK > 0 and okU[g]:
+                    bad_u = np.nonzero(~okU[g:])[0]
+                    vu = int(bad_u[0]) if len(bad_u) else ln - g
+                    while vu < ln - g:
+                        a_ = g + vu
+                        if not u_carry[a_]:
+                            break
+                        lim_u = min(ln, a_ + UNECK)
+                        nc_ = np.nonzero(~u_carry[a_:lim_u + 1])[0]
+                        end_u = a_ + int(nc_[0]) if len(nc_) else lim_u + 1
+                        found_u = -1
+                        for b_ in range(a_ + 1, end_u):
+                            sust_e = min(ln + 1, b_ + USUST)
+                            if okU[b_] and (sust_e - b_ >= min(USUST, max(40, ln + 1 - b_))) and okU[b_:sust_e].all():
+                                found_u = b_
+                                break
+                        if found_u < 0:
+                            break
+                        okU[a_:found_u] = True
+                        bad_u2 = np.nonzero(~okU[found_u:])[0]
+                        vu = (found_u + int(bad_u2[0]) - g) if len(bad_u2) else ln - g
+        ok = okF | okG | okJ | okB | okU
         if broken <= ln:
             ok &= x < broken
         bad = np.nonzero(~ok[g:])[0]
@@ -713,7 +796,7 @@ def _verify(loaded, read_len, detail, patches, inside, only):
         # somewhere along ten kilobases must not count.
         nbridge = 0
         if BRIDGE and V < ln - g:
-            okd = okF | okG | okB
+            okd = okF | okG | okB | okU
             bb_ = base.copy()
             if broken <= ln:
                 okd &= x < broken
@@ -770,5 +853,5 @@ def _verify(loaded, read_len, detail, patches, inside, only):
             for xx in range(g, min(ln, g + 3000), 25):
                 sys.stderr.write("  %5d depth %4.0f supply %5.1f low %4.0f join %5d tau %4d tg %3d budget %5.1f (start %.0f)  %s\n" % (
                     xx - g, ds[xx], Fa[xx], clow[xx], pstar[xx] - g if pstar[xx] >= 0 else -1, tau[xx], tg[xx], O[xx], c0,
-                    " ".join(k for k, v in (("F", okF), ("G", okG), ("J", okJ), ("B", okB)) if v[xx])))
+                    " ".join(k for k, v in (("F", okF), ("G", okG), ("J", okJ), ("B", okB), ("U", okU)) if v[xx])))
     return out

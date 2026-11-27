@@ -15,6 +15,8 @@ argjacent/bin/awv
 
 # Demo, sequencing data, and run outputs
 demo_out/
+global_run/
+.worktrees/
 *.fq
 *.fastq
 *.fq.gz

@@ -39,14 +39,16 @@
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
-#define AWX_VERSION "0.5.1"
+#define AWX_VERSION "0.6.0"
 #define K 31
+#define K2 19
+#define PB2 20
 #define SAMP 8
 #define QMIN 15
 #define REDO 0              /* the gene part is the seed as given; reads are laid on it with differences tolerated */
 #define MAXQ 512
 #define LA 60
-static int PATCH = 1;
+static int PATCH = 1, RESCUE = 1;
 #ifndef ALTMAX
 #define ALTMAX 64
 #endif
@@ -65,8 +67,9 @@ typedef struct {
 } St;
 static uint8_t *rs; static Read *rd; static uint32_t nr = 0;
 static Ent *ix; static size_t nix = 0;
+static Ent *ix2; static size_t nix2 = 0;
 #define PB 24                                     /* the index is entered through a table of the K-mers' first 12 bases */
-static uint32_t *pt;
+static uint32_t *pt, *pt2;
 static int8_t code[256];
 /* what belongs to the gene end being extended: one per thread */
 static __thread int EX0; static __thread int redo = 0;
@@ -79,6 +82,12 @@ static long find(uint64_t km) {                     /* the first index entry wit
     size_t lo = pt[km >> (2 * K - PB)], hi = pt[(km >> (2 * K - PB)) + 1];
     while (lo < hi) { size_t mid = (lo + hi) / 2; if (ix[mid].km < km) lo = mid + 1; else hi = mid; }
     return lo < pt[(km >> (2 * K - PB)) + 1] && ix[lo].km == km ? (long)lo : -1;
+}
+static long find2(uint64_t km) {                    /* the first K2-mer tip-index entry, or -1 */
+    if (!pt2) return -1;
+    size_t lo = pt2[km >> (2 * K2 - PB2)], hi = pt2[(km >> (2 * K2 - PB2)) + 1];
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (ix2[mid].km < km) lo = mid + 1; else hi = mid; }
+    return lo < pt2[(km >> (2 * K2 - PB2)) + 1] && ix2[lo].km == km ? (long)lo : -1;
 }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static inline uint8_t rb(uint32_t r, int s, int i) {      /* base i of read r in orientation s; bit 3 = low quality */
@@ -172,9 +181,143 @@ static void discover(St *s) {                            /* reads that carry the
 }
 static const int TIER[4] = { 110, 80, 55, K };
 static int flank_target = 10000; static __thread int glen;
+/* true if read r in orientation sd contains a >=12-bp homopolymer/dinucleotide tail or Illumina adapter seed from off0 */
+static int has_junk_tail(uint32_t r, int sd, int off0) {
+    /* AGATCGGAAGAGC (TruSeq: 0,2,0,3,1,2,2,0,0,2,0,2,1) and CTGTCTCTTATA (Nextera: 1,3,2,3,1,3,1,3,3,0,3,0) */
+    static const uint8_t A1[13] = {0,2,0,3,1,2,2,0,0,2,0,2,1}, A2[12] = {1,3,2,3,1,3,1,3,3,0,3,0};
+    int L = rd[r].len, run1 = 1, run2 = 2, start = off0 > 12 ? off0 - 12 : 0;
+    for (int i = off0 + 1; i < L; i++) {
+        uint8_t b = rb(r, sd, i) & 7, b1 = rb(r, sd, i - 1) & 7;
+        if (b < 4 && b == b1) { if (++run1 >= 12) return 1; } else run1 = 1;
+        if (i >= off0 + 2) {
+            uint8_t b2 = rb(r, sd, i - 2) & 7;
+            if (b < 4 && b == b2) { if (++run2 >= 16) return 1; } else run2 = 2;
+        }
+    }
+    for (int i = start; i + 13 <= L; i++) {
+        int m1 = 1, m2 = 1;
+        for (int k = 0; k < 13; k++) if ((rb(r, sd, i + k) & 7) != A1[k]) { m1 = 0; break; }
+        if (m1) return 1;
+        for (int k = 0; k < 12; k++) if ((rb(r, sd, i + k) & 7) != A2[k]) { m2 = 0; break; }
+        if (m2) return 1;
+    }
+    return 0;
+}
+/* stall rescue when K=31 overlap runs out at low coverage:
+   (1) mate-anchored FR reads (downstream mate sd_m=1 of an upstream sd_r=0 read already placed on s within 1200 bp)
+       matching the tip over >= 14 bp (<= 1 SNP at >= 24 bp);
+   (2) unambiguous K2=19 read-tip overlaps (19..43 bp, 0 mismatches, <= 32 bucket hits, >= 80% 10-bp forward agreement). */
+static int rescue_stall(St *s) {
+    if (s->len < K) return 0;
+    int added = 0;
+    /* 1. Mate-anchored FR short-overlap / 1-mismatch rescue */
+    for (uint32_t h = 0; h <= s->pmask; h++) {
+        if (!s->pm[h].k) continue;
+        uint32_t r = (s->pm[h].k >> 1) - 1;
+        int sd_r = (int)(s->pm[h].k & 1);
+        int32_t d_r = s->pm[h].d;
+        if (sd_r != 0 || d_r < s->len - 1200 || d_r >= s->len) continue;
+        uint32_t m = r ^ 1;
+        if (m >= nr || rd[m].len < 35) continue;
+        int sd_m = 1, L = rd[m].len;
+        const PE *em = pm_find(s, m);
+        if (em && (int)(em->k & 1) == sd_m && em->d + L > s->len) continue;
+        int max_ov = L - 10;
+        if (max_ov > 150) max_ov = 150;
+        if (max_ov > s->len) max_ov = s->len;
+        for (int ov = max_ov; ov >= 14; ov--) {
+            int d = s->len - ov;
+            if (d <= d_r || d - d_r > 1200) continue;
+            uint8_t bn = rb(m, sd_m, ov);
+            if ((bn & 8) || (bn & 7) > 3) continue;
+            int max_mm = ov >= 45 ? 2 : (ov >= 24 ? 1 : 0);
+            int mm = 0, okb = 0, tip_bad = 0;
+            for (int i = ov - 1; i >= 0; i--) {
+                uint8_t b = rb(m, sd_m, i);
+                int p = d + i;
+                if ((b & 8) || (b & 7) > 3) continue;
+                if ((b & 7) != s->P[p]) {
+                    if (p < EX0) { mm++; }
+                    else {
+                        if (ov - 1 - i < 8) { tip_bad = 1; break; }
+                        if (++mm > max_mm) break;
+                    }
+                } else okb++;
+            }
+            work += (uint64_t)(ov / 2 + 4);
+            if (!tip_bad && mm <= max_mm && okb >= 14 && !has_junk_tail(m, sd_m, ov)) {
+                act_add(s, m, sd_m, d, 0);
+                added++;
+                break;
+            }
+        }
+    }
+    if (added > 0) return 1;
+    /* 2. Unambiguous K2=19 read-tip index rescue (19..43 bp exact overlap, single consensus forward extension) */
+    if (!ix2 || s->len < K2 + 3) return 0;
+    uint32_t cr[64]; int csd[64], cd[64], nc = 0;
+    for (int sh = 0; sh < 4; sh++) {
+        int p0 = s->len - K2 - sh;
+        if (p0 < 0) break;
+        uint64_t km = 0, rc = 0; int bad = 0;
+        for (int i = 0; i < K2; i++) {
+            uint8_t b = s->P[p0 + i];
+            if (b > 3) { bad = 1; break; }
+            km = (km << 2) | b;
+            rc = (rc >> 2) | ((uint64_t)(3 - b) << (2 * (K2 - 1)));
+        }
+        if (bad) continue;
+        for (int o2 = 0; o2 < 2; o2++) {
+            uint64_t qk = o2 ? rc : km;
+            long p = find2(qk);
+            if (p < 0) continue;
+            if ((size_t)p + 32 < nix2 && ix2[p + 32].km == qk) continue;     /* skip hot/repetitive 19-mers */
+            for (size_t j = (size_t)p; j < nix2 && ix2[j].km == qk; j++) {
+                uint32_t r = ix2[j].r; int L = rd[r].len;
+                int o = o2 ? L - K2 - ix2[j].o : ix2[j].o;
+                int d = p0 - o, ov = s->len - d;
+                if (ov < K2 || ov > 43 || d < 0 || d + L < s->len + 15) continue;
+                const PE *e = pm_find(s, r);
+                if (e && (int)(e->k & 1) == o2 && e->d == d) continue;
+                int dup = 0;
+                for (int k = 0; k < nc; k++) if (cr[k] == r && csd[k] == o2 && cd[k] == d) { dup = 1; break; }
+                if (dup) continue;
+                uint8_t bn = rb(r, o2, ov);
+                if ((bn & 8) || (bn & 7) > 3) continue;
+                int mm = 0, okb = 0;
+                for (int i = 0; i < ov; i++) {
+                    uint8_t b = rb(r, o2, i);
+                    if ((b & 8) || (b & 7) > 3) continue;
+                    if ((b & 7) != s->P[d + i]) { if (d + i >= EX0) { mm = 99; break; } mm++; }
+                    else okb++;
+                }
+                work += 24;
+                if (mm == 0 && okb >= K2 - 1 && !has_junk_tail(r, o2, ov) && nc < 64) {
+                    cr[nc] = r; csd[nc] = o2; cd[nc] = d; nc++;
+                }
+            }
+        }
+    }
+    if (nc == 0) return 0;
+    for (int k = 0; k < 10; k++) {
+        int vc[4] = {0, 0, 0, 0};
+        for (int c = 0; c < nc; c++) {
+            int idx_ = s->len + k - cd[c];
+            if (idx_ >= 0 && idx_ < rd[cr[c]].len) {
+                uint8_t b = rb(cr[c], csd[c], idx_);
+                if (!(b & 8) && (b & 7) < 4) vc[b & 7]++;
+            }
+        }
+        int totv = vc[0] + vc[1] + vc[2] + vc[3], top = 0;
+        for (int b = 0; b < 4; b++) if (vc[b] > top) top = vc[b];
+        if (totv >= 2 && (totv - top >= 2 || top * 100 < 80 * totv)) return 0;   /* ambiguous 19-bp fork: abstain */
+    }
+    for (int c = 0; c < nc; c++) act_add(s, cr[c], csd[c], cd[c], 0);
+    return 1;
+}
 /* extend one state to its end; arms not taken are pushed onto q */
 static void extend(St *s, St **q, int *nq, int maxq) {
-    int target = glen + flank_target;
+    int target = glen + flank_target, last_rescue = -1;
     static __thread uint64_t *seen = NULL; static __thread int seen_cap = 0;
     if (!seen) { seen_cap = 1 << 16; while (seen_cap < 4 * (target + 64)) seen_cap <<= 1; seen = malloc((size_t)seen_cap * 8); }   /* the K-mers of one path: never more than a quarter full */
     memset(seen, 0xff, (size_t)seen_cap * 8);
@@ -183,7 +326,7 @@ static void extend(St *s, St **q, int *nq, int maxq) {
     while (s->len < target) {
         if (work > WORKMAX) { strcpy(s->why, "work cap"); break; }
         work += (uint64_t)s->na;
-        int cnt[4][4]; memset(cnt, 0, sizeof cnt); int cntA[4] = {0};
+        int cnt[4][4]; memset(cnt, 0, sizeof cnt); int cntA[4] = {0}, cntR[4] = {0};
         int w = 0;
         for (int a = 0; a < s->na; a++) {
             Act A = s->act[a]; int i = s->len - A.d;
@@ -195,12 +338,28 @@ static void extend(St *s, St **q, int *nq, int maxq) {
             int ov = s->len - (A.d > 0 ? A.d : 0);
             cntA[b & 7]++;
             if (A.nt) continue;                          /* awxq: the base is chosen by the reads without a difference */
+            if (ov >= 14) cntR[b & 7]++;
             for (int t = 0; t < 4; t++) if (ov >= TIER[t]) cnt[t][b & 7]++;
         }
         s->na = w;
         int tot3 = cnt[3][0] + cnt[3][1] + cnt[3][2] + cnt[3][3];
         int totA = cntA[0] + cntA[1] + cntA[2] + cntA[3];
+        int totR = cntR[0] + cntR[1] + cntR[2] + cntR[3];
         if (QTOL && tot3 < 2 && totA > tot3) { memset(cnt, 0, sizeof cnt); for (int b = 0; b < 4; b++) cnt[3][b] = cntA[b]; tot3 = totA; }   /* awxq: (nearly) none without a difference: all decide */
+        if (tot3 < 1 && totR > 0) { for (int b = 0; b < 4; b++) cnt[3][b] = cntR[b]; tot3 = totR; }
+        if (tot3 < 1 && RESCUE && last_rescue != s->len) {
+            last_rescue = s->len;
+            if (rescue_stall(s)) continue;
+            for (int a = 0; a < s->na; a++) {            /* 1x read with one Q<15 base surrounded by Q>=15 bases */
+                Act A = s->act[a]; int i = s->len - A.d;
+                if (A.nt || i < 0 || A.skip > s->len || i + 5 >= rd[A.r].len || s->len - (A.d > 0 ? A.d : 0) < 14) continue;
+                uint8_t b = rb(A.r, A.s, i); if ((b & 7) > 3) continue;
+                int hq = 0;
+                for (int k = 1; k <= 5; k++) { uint8_t c = rb(A.r, A.s, i + k); if (!(c & 8) && (c & 7) < 4) hq++; }
+                if (hq >= 3) cnt[3][b & 7]++;
+            }
+            tot3 = cnt[3][0] + cnt[3][1] + cnt[3][2] + cnt[3][3];
+        }
         if (tot3 < 1) { strcpy(s->why, "ran out of reads"); break; }
         int t = 3;
         for (int u = 0; u < 3; u++) if (cnt[u][0] + cnt[u][1] + cnt[u][2] + cnt[u][3] >= 4) { t = u; break; }
@@ -212,7 +371,16 @@ static void extend(St *s, St **q, int *nq, int maxq) {
         int anyvar = 0; for (int b = 0; b < 4; b++) if (b != b1 && cnt[3][b] >= 2 && cnt[3][b] * 100 >= 15 * tot3) anyvar = 1;
         if (QTOL) for (int b = 0; b < 4; b++) if (b != b1 && cntA[b] >= 2 && cntA[b] * 100 >= 15 * totA) anyvar = 1;
         int isvar[4] = {0}, vsh[4] = {0}, vty[4] = {0};
-        if (tot3 == 1) s->nthin++;
+        if (tot3 == 1) {
+            /* Do not extend on a lone 1-read support if that read is transitioning into sequencing adapter / homopolymer tail */
+            int ok1 = 0;
+            for (int a = 0; a < s->na; a++) {
+                Act A = s->act[a]; int i = s->len - A.d;
+                if (i >= 0 && i < rd[A.r].len && A.skip <= s->len && !has_junk_tail(A.r, A.s, i)) { ok1 = 1; break; }
+            }
+            if (!ok1) { strcpy(s->why, "ran out of reads"); break; }
+            s->nthin++;
+        }
         if (split || anyvar) {            /* awx6: an arm seen only by reads with a short overlap is looked at everywhere, not only after another locus came on */
             /* arms: what the reads of each base say next, and how many are linked by their mates to the path before the join */
             int n[4] = {0}, anch[4] = {0}; uint8_t la[4][LA + 1]; int lc[4][LA + 1][4]; memset(lc, 0, sizeof lc);
@@ -351,22 +519,24 @@ static void *worker(void *arg) {
     }
     return NULL;
 }
-static size_t sort_next = 0;
+static size_t sort_next = 0, sort_tot = (size_t)1 << PB;
+static Ent *sort_ix = NULL;
+static uint32_t *sort_pt = NULL;
 static void *sort_worker(void *arg) {
     (void)arg;
-    const size_t CHUNK = 1 << 14, TOT = (size_t)1 << PB;
+    const size_t CHUNK = 1 << 14, TOT = sort_tot;
     for (;;) {
         size_t p0 = __sync_fetch_and_add(&sort_next, CHUNK);
         if (p0 >= TOT) break;
         size_t p1 = p0 + CHUNK < TOT ? p0 + CHUNK : TOT;
         for (size_t p = p0; p < p1; p++) {
-            size_t a = pt[p], b = pt[p + 1];
+            size_t a = sort_pt[p], b = sort_pt[p + 1];
             if (b - a < 2) continue;
-            if (b - a > 32) { qsort(ix + a, b - a, sizeof(Ent), cmp_ent); continue; }
+            if (b - a > 32) { qsort(sort_ix + a, b - a, sizeof(Ent), cmp_ent); continue; }
             for (size_t i = a + 1; i < b; i++) {            /* few entries: insertion keeps the order of read and offset among equal K-mers */
-                Ent e = ix[i]; size_t j = i;
-                while (j > a && ix[j - 1].km > e.km) { ix[j] = ix[j - 1]; j--; }
-                ix[j] = e;
+                Ent e = sort_ix[i]; size_t j = i;
+                while (j > a && sort_ix[j - 1].km > e.km) { sort_ix[j] = sort_ix[j - 1]; j--; }
+                sort_ix[j] = e;
             }
         }
     }
@@ -374,8 +544,8 @@ static void *sort_worker(void *arg) {
 }
 int main(int argc, char **argv) {
     int c, nt = 1; const char *rspec = "0";
-    while ((c = getopt(argc, argv, "c:D:r:m:t:vP:Q:")) != -1) {
-        if (c == 'c') maxc = atoi(optarg); else if (c == 'P') PATCH = atoi(optarg); else if (c == 'Q') QTOL = atoi(optarg); else if (c == 'D') flank_target = atoi(optarg); else if (c == 'r') rspec = optarg;
+    while ((c = getopt(argc, argv, "c:D:r:m:t:vP:Q:R:")) != -1) {
+        if (c == 'c') maxc = atoi(optarg); else if (c == 'P') PATCH = atoi(optarg); else if (c == 'Q') QTOL = atoi(optarg); else if (c == 'R') RESCUE = atoi(optarg); else if (c == 'D') flank_target = atoi(optarg); else if (c == 'r') rspec = optarg;
         else if (c == 't') nt = atoi(optarg);
         else if (c == 'm') minmass = atof(optarg);          /* arms that carry a smaller share of the gene's reads are not extended */
         else if (c == 'v') { printf("awx %s\n", AWX_VERSION); return 0; }
@@ -437,12 +607,51 @@ int main(int argc, char **argv) {
     }
     /* now pt[p] is where bucket p begins and pt[p + 1] where it ends: independent buckets, sorted across threads */
     if (nt < 1) nt = 1; if (nt > 64) nt = 64;
-    sort_next = 0;
+    sort_next = 0; sort_tot = (size_t)1 << PB; sort_ix = ix; sort_pt = pt;
     if (nt == 1) sort_worker(NULL);
     else {
         pthread_t sth[64];
         for (int i = 0; i < nt; i++) if (pthread_create(&sth[i], NULL, sort_worker, NULL)) { perror("awx: cannot start a thread"); return 1; }
         for (int i = 0; i < nt; i++) pthread_join(sth[i], NULL);
+    }
+    if (RESCUE) {
+        pt2 = calloc(((size_t)1 << PB2) + 2, 4);
+        if (!pt2) { fprintf(stderr, "awx: out of memory while building tip index\n"); return 2; }
+        const uint64_t kmask2 = (1ULL << (2 * K2)) - 1;
+        for (int go = 0; go < 2; go++) {
+            for (uint32_t r = 0; r < nr; r++) {
+                int L = rd[r].len; if (L < K2) continue;
+                const uint8_t *rp = rs + rd[r].off;
+                uint64_t km = 0; int valid = 0;
+                for (int p = 0; p < L; p++) {
+                    uint8_t b = rp[p] & 7;
+                    if (b > 3) { valid = 0; km = 0; } else { km = ((km << 2) | b) & kmask2; valid++; }
+                    int o = p - (K2 - 1);
+                    if (o >= 0 && valid >= K2) {
+                        int tip_f = (o <= 24 && (o & 3) == 0);
+                        int tip_r = (L - K2 - o <= 24 && ((L - K2 - o) & 3) == 0);
+                        if (tip_f || tip_r) {
+                            if (go) ix2[pt2[(km >> (2 * K2 - PB2)) + 1]++] = (Ent){ km, r, (uint16_t)o };
+                            else { pt2[(km >> (2 * K2 - PB2)) + 2]++; nix2++; }
+                        }
+                    }
+                }
+            }
+            if (go) break;
+            if (nix2 >= 0xFFFFFFF0ULL) { free(pt2); pt2 = NULL; nix2 = 0; break; }
+            for (size_t p = 0; p < ((size_t)1 << PB2); p++) pt2[p + 2] += pt2[p + 1];
+            ix2 = malloc((nix2 + 1) * sizeof(Ent));
+            if (!ix2) { fprintf(stderr, "awx: out of memory (tip index)\n"); return 2; }
+        }
+        if (ix2) {
+            sort_next = 0; sort_tot = (size_t)1 << PB2; sort_ix = ix2; sort_pt = pt2;
+            if (nt == 1) sort_worker(NULL);
+            else {
+                pthread_t sth[64];
+                for (int i = 0; i < nt; i++) if (pthread_create(&sth[i], NULL, sort_worker, NULL)) { perror("awx: cannot start a thread"); return 1; }
+                for (int i = 0; i < nt; i++) pthread_join(sth[i], NULL);
+            }
+        }
     }
     double t_index = now();
     { double per = 5.0 * (double)nr + 4096.0; pool_cap = (int)(600e6 / per); if (pool_cap < 16) pool_cap = 16; if (pool_cap > MAXQ - 1) pool_cap = MAXQ - 1; }

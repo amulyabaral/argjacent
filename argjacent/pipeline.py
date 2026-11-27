@@ -23,6 +23,9 @@ REDO = 300        # of which the last 300 may be the sample's own
 MAXDIFF = 30      # ... if at most 30 of them differ from the gene as given (90 % identity)
 NEAR = 100        # the end claim ("a context of a gene that ENDS like this one") is made only for a candidate whose own last
 NEARDIFF = 10     # NEAR bases of the gene part differ from the gene as given in at most NEARDIFF places
+MAXNEAR = 15      # sample gene-end guard: > 15 diffs in the last 100 bases (< 85 % local identity) marks a relative's terminus
+TIP = 30          # terminal k-mer boundary window right at the gene-flank junction
+MAXTIP = 9        # sample gene-end guard: >= 10 diffs in the last 30 bases (< 70 % boundary identity) marks a terminal fusion/truncation
 TOLERANT = ["-T", "50", "-B", "1", "-I", "12", "-g", "30", "-w", "9"]   # the tolerant measure of awv: single differences, small patches, one small insertion or deletion
 
 
@@ -88,20 +91,27 @@ def merge(genes, prefix, cdir):
                 sides.append(c[0])
         cands = []
         for side in sides:
-            rs = [(c, _end_diffs(genes[i][1], side, c[2], c[3])) for c in r if c[0] == side]
-            keep = [(c, d, "sample") for c, d in rs if d <= MAXDIFF]
+            seq_i = genes[i][1]
+            rs = [(c, _end_diffs(seq_i, side, c[2], c[3]),
+                   _end_diffs(seq_i, side, c[2], c[3], NEAR),
+                   _end_diffs(seq_i, side, c[2], c[3], TIP)) for c in r if c[0] == side]
+            keep = [(c, d, dn, dt, "sample") for c, d, dn, dt in rs
+                    if d <= MAXDIFF and dn <= MAXNEAR and dt <= MAXTIP]
             if keep:
                 st["sides_sample_end"] += 1
                 st["dropped_too_far"] += len(rs) - len(keep)
             else:
-                keep = [(c, _end_diffs(genes[i][1], side, c[2], c[3]), "database") for c in p if c[0] == side]
+                keep = [(c, _end_diffs(seq_i, side, c[2], c[3]),
+                         _end_diffs(seq_i, side, c[2], c[3], NEAR),
+                         _end_diffs(seq_i, side, c[2], c[3], TIP), "database")
+                        for c in p if c[0] == side]
                 st["sides_database_end"] += 1
                 if rs:
                     st["sides_sample_end_too_far"] += 1
-            for n, (c, d, src) in enumerate(keep, 1):
+            for n, (c, d, dn, dt, src) in enumerate(keep, 1):
                 cands.append({"side": side, "cand": n, "gene_part": c[2], "seq": c[3], "stop": c[4]["stop"],
                               "gene_end": src, "gene_end_diffs": d, "run_cand": int(c[1]),
-                              "gene_end_diffs_near": _end_diffs(genes[i][1], side, c[2], c[3], NEAR)})
+                              "gene_end_diffs_near": dn, "gene_end_diffs_tip": dt})
             st["candidates"] += len(keep)
         if cands:
             out[i] = cands

@@ -601,12 +601,16 @@ def run(a, bins, genes, tmp):
         for c in cands.get(i, []):
             v = ver.get(i, {}).get("%d|%s|%d|%d|0|0" % (i, c["side"], c["cand"], c["gene_part"]))
             fl = c["seq"][c["gene_part"]:]
-            certain = 0 if (v is None or no_claims) else max(0, min(v["verified"], len(fl)) - cut)
+            term_ok = (v is not None and not no_claims
+                       and c.get("gene_end_diffs_near", 0) <= pipeline.MAXNEAR
+                       and c.get("gene_end_diffs_tip", 0) <= pipeline.MAXTIP)
+            certain = max(0, min(v["verified"], len(fl)) - cut) if term_ok else 0
             # The end claim says "a context of a gene that ENDS like this one": only for a candidate whose own last 100 gene bases
             # are like the gene's. A sample's gene end may differ from the gene in up to 30 of its last 300 bases; where those
-            # crowd into the last 100, the candidate carries a relative's end (two-strain E. coli case, 20 Nov 2026: a relative
-            # 83 % like the gene over its last 100 bases had its flank called certain for 1,821 bases under the end claim).
-            end_ok = v is not None and not no_claims and c.get("gene_end_diffs_near", 0) <= pipeline.NEARDIFF
+            # crowd into the last 100 (or >= 10 into the terminal 30-bp boundary, e.g. cfxA6 vs cfxA5 C-terminal divergence),
+            # the candidate carries a relative's end (two-strain E. coli case, 20 Nov 2026: a relative 83 % like the gene over
+            # its last 100 bases had its flank called certain for 1,821 bases under the end claim).
+            end_ok = term_ok and c.get("gene_end_diffs_near", 0) <= pipeline.NEARDIFF
             end = max(certain, max(0, min(v["verified_end"], len(fl)) - cut)) if end_ok else certain
             p = {"flank": fl if c["side"] == "right" else fl.translate(COMP)[::-1], "flank_len": len(fl), "context_len": certain,
                  "end_len": end, "shared_end": v["shared_end"] if v else 0,
@@ -618,6 +622,7 @@ def run(a, bins, genes, tmp):
                  "stop": STOPS.get(c["stop"], c["stop"].replace(" ", "_")),
                  "certain_stop": (v["stop"] if not no_claims else "reads_too_short") if v else "failed",
                  "main": c["cand"] == 1, "gene_end": c["gene_end"], "gene_end_diffs": c["gene_end_diffs"],
+                 "gene_end_diffs_near": c.get("gene_end_diffs_near", 0),
                  "joins": v["joins"] if v else 0, "open_joins": v["open_joins"] if v else 0,
                  "genes": [dict(x, certain=x["to_bp"] <= certain) for x in og.get((i, c["side"], c["cand"]), [])]}
             sides[c["side"]].append(p)

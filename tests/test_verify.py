@@ -64,6 +64,7 @@ def test_the_rules_give_the_lengths_of_the_prototype(data, cli, tmp_path, case, 
         mp.setattr(verify, "UNEV", 0.0)                    # ... and depth is taken to be even
         mp.setattr(verify, "AFTERG", False)                # ... and reads that leave in the gene's last 20 bases are among the charges
         mp.setattr(verify, "BRIDGE", 0)                    # ... and the certain part ends at the first position nothing vouches for
+        mp.setattr(verify, "ULEV", False)                  # ... and low-depth unbranched mate-bridged certification is off
         mine = verify.verify_gene(out + ".tmp/v/0")
     theirs = ref.verify_gene(out + ".tmp/v/0", opts)
     assert len(mine) == len(theirs) > 1
